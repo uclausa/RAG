@@ -1,0 +1,1139 @@
+import io
+import re
+from collections import Counter, defaultdict
+
+import fitz
+import numpy as np
+from PIL import Image
+
+
+class PDFLayoutCleaner:
+    """
+    Detects:
+
+    1. Actual document content area
+    2. Repeated headers
+    3. Repeated footers
+    4. Boilerplate drawings
+    5. Boilerplate images
+
+    Designed for enterprise SOP PDFs with varying layouts.
+    """
+
+    def __init__(
+        self,
+        doc,
+        header_zone_frac=0.15,
+        footer_zone_frac=0.15,
+        min_repeat_frac=0.50,
+    ):
+
+        if header_zone_frac + footer_zone_frac >= 1:
+            raise ValueError(
+                "header_zone_frac + footer_zone_frac must be < 1 "
+                "(otherwise the header/footer zones swallow the whole page)"
+            )
+
+        self.doc = doc
+
+        self.header_zone_frac = header_zone_frac
+        self.footer_zone_frac = footer_zone_frac
+        self.min_repeat_frac = min_repeat_frac
+
+        self._content_bbox_cache = {}
+        self._page_blocks_cache = {}
+        self._page_drawings_cache = {}
+        self._page_images_cache = {}
+
+        self._boilerplate_signatures = set()
+
+        self._boilerplate_drawings = set()
+        self._boilerplate_images = set()
+
+        self._analyzed = False
+
+    # ----------------------------------------------------------
+    # CONTENT DETECTION
+    # ----------------------------------------------------------
+
+    def _compute_content_bbox(self, page):
+
+        rects = []
+
+        # -----------------------------
+        # TEXT BLOCKS
+        # -----------------------------
+
+        for block in page.get_text("dict").get("blocks", []):
+
+            bbox = block.get("bbox")
+
+            if bbox is None:
+                continue
+
+            x0, y0, x1, y1 = bbox
+
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            rects.append(fitz.Rect(x0, y0, x1, y1))
+
+        # -----------------------------
+        # VECTOR DRAWINGS
+        # -----------------------------
+
+        for drawing in self._get_page_drawings(page):
+
+            r = drawing["bbox"]
+
+            if r.width < 2 or r.height < 2:
+                continue
+
+            rects.append(r)
+
+        # -----------------------------
+        # IMAGES
+        # -----------------------------
+
+        for image in self._get_page_images(page):
+
+            r = image["bbox"]
+
+            rects.append(r)
+
+        # -----------------------------
+        # Remove page borders
+        # -----------------------------
+
+        filtered = []
+
+        page_area = page.rect.width * page.rect.height
+
+        for r in rects:
+
+            area = r.width * r.height
+
+            if area > page_area * 0.95:
+                continue
+
+            filtered.append(r)
+
+        rects = filtered
+
+        # -----------------------------
+        # Object bbox
+        # -----------------------------
+
+        if rects:
+
+            object_bbox = rects[0]
+
+            for r in rects[1:]:
+
+                object_bbox |= r
+
+        else:
+
+            object_bbox = page.rect
+
+        # -----------------------------
+        # Pixel bbox
+        # -----------------------------
+
+        pixel_bbox = self._compute_pixel_content_bbox(page)
+
+        final_bbox = fitz.Rect(
+
+            min(object_bbox.x0, pixel_bbox.x0),
+
+            min(object_bbox.y0, pixel_bbox.y0),
+
+            max(object_bbox.x1, pixel_bbox.x1),
+
+            max(object_bbox.y1, pixel_bbox.y1),
+
+        )
+
+        pad_x = max(4, final_bbox.width * 0.01)
+
+        pad_y = max(4, final_bbox.height * 0.01)
+
+        return fitz.Rect(
+
+            max(page.rect.x0, final_bbox.x0 - pad_x),
+
+            max(page.rect.y0, final_bbox.y0 - pad_y),
+
+            min(page.rect.x1, final_bbox.x1 + pad_x),
+
+            min(page.rect.y1, final_bbox.y1 + pad_y),
+
+        )
+
+    # ----------------------------------------------------------
+    # PIXEL CONTENT DETECTION
+    # ----------------------------------------------------------
+
+    def _compute_pixel_content_bbox(
+        self,
+        page,
+        threshold=245,
+    ):
+
+        pix = page.get_pixmap(
+
+            dpi=120,
+
+            colorspace=fitz.csGRAY,
+
+            alpha=False,
+
+        )
+
+        img = Image.open(
+
+            io.BytesIO(
+
+                pix.tobytes("png")
+
+            )
+
+        )
+
+        arr = np.array(img)
+
+        mask = arr < threshold
+
+        if not np.any(mask):
+
+            return page.rect
+
+        rows = np.where(mask.any(axis=1))[0]
+
+        cols = np.where(mask.any(axis=0))[0]
+
+        # Ignore tiny noisy rows
+
+        row_limit = max(
+            8,
+            int(arr.shape[1] * 0.01),
+        )
+
+        rows = [
+
+            r
+
+            for r in rows
+
+            if np.count_nonzero(mask[r]) > row_limit
+
+        ]
+
+        # Ignore tiny noisy columns
+
+        col_limit = max(
+            8,
+            int(arr.shape[0] * 0.01),
+        )
+
+        cols = [
+
+            c
+
+            for c in cols
+
+            if np.count_nonzero(mask[:, c]) > col_limit
+
+        ]
+
+        if not rows or not cols:
+
+            return page.rect
+
+        top = rows[0]
+
+        bottom = rows[-1]
+
+        left = cols[0]
+
+        right = cols[-1]
+
+        sx = page.rect.width / arr.shape[1]
+
+        sy = page.rect.height / arr.shape[0]
+
+        return fitz.Rect(
+
+            left * sx,
+
+            top * sy,
+
+            right * sx,
+
+            bottom * sy,
+
+        )
+
+    def _get_page_blocks(self, page):
+        """
+        Return all text blocks on the page.
+
+        Results are cached because this function is
+        called many times during analysis.
+        """
+
+        if page.number in self._page_blocks_cache:
+            return self._page_blocks_cache[page.number]
+
+        blocks = []
+
+        text_dict = page.get_text("dict")
+
+        for block in text_dict.get("blocks", []):
+
+            # Only text blocks
+            if block.get("type", 0) != 0:
+                continue
+
+            text = ""
+
+            for line in block.get("lines", []):
+
+                for span in line.get("spans", []):
+
+                    text += span.get("text", "")
+
+                text += " "
+
+            text = text.strip()
+
+            if not text:
+                continue
+
+            blocks.append(
+                {
+                    "bbox": fitz.Rect(block["bbox"]),
+                    "text": text,
+                }
+            )
+
+        self._page_blocks_cache[page.number] = blocks
+
+        return blocks
+
+    def _get_page_drawings(self, page):
+        """
+        Return vector drawings on the page.
+
+        Cached per page since this is called both during
+        content-bbox computation and during boilerplate analysis.
+        """
+
+        if page.number in self._page_drawings_cache:
+            return self._page_drawings_cache[page.number]
+
+        drawings = []
+
+        try:
+            for d in page.get_drawings():
+
+                rect = d.get("rect")
+
+                if rect is None:
+                    continue
+
+                if rect.width <= 0 or rect.height <= 0:
+                    continue
+
+                drawings.append({
+                    "bbox": fitz.Rect(rect),
+                    "type": d.get("type", "")
+                })
+
+        except Exception:
+            pass
+
+        self._page_drawings_cache[page.number] = drawings
+
+        return drawings
+
+    def _get_page_images(self, page):
+        """
+        Return raster images on the page.
+
+        Cached per page for the same reason as
+        `_get_page_drawings` above. This method was previously
+        referenced (in `analyze()` and `get_header_footer_rects()`)
+        but never defined -- that's the bug that made `.analyze()`
+        raise an AttributeError.
+        """
+
+        if page.number in self._page_images_cache:
+            return self._page_images_cache[page.number]
+
+        images = []
+
+        try:
+            for image in page.get_image_info():
+
+                bbox = image.get("bbox")
+
+                if bbox is None:
+                    continue
+
+                r = fitz.Rect(bbox)
+
+                if r.width <= 0 or r.height <= 0:
+                    continue
+
+                images.append({"bbox": r})
+
+        except Exception:
+            pass
+
+        self._page_images_cache[page.number] = images
+
+        return images
+
+    def _normalize_text(self, text):
+        """
+        Normalize header/footer text so that repeated boilerplate
+        matches across pages even when it contains a changing
+        page number (e.g. "Page 3 of 42" vs "Page 4 of 42").
+
+        This method was previously referenced (in `analyze()` and
+        `get_clean_blocks()`) but never defined -- `import re` at
+        the top of the file was an orphaned import waiting for it.
+        """
+
+        t = text.lower()
+
+        # Collapse any run of digits to a single placeholder so
+        # page numbers / dates don't prevent otherwise-identical
+        # header or footer text from matching across pages.
+        t = re.sub(r"\d+", "#", t)
+
+        # Collapse whitespace
+        t = re.sub(r"\s+", " ", t).strip()
+
+        return t
+
+    def analyze(self):
+        """
+        Analyze the entire PDF.
+
+        Detects:
+
+        • Content area
+        • Repeated text headers/footers
+        • Repeated drawings
+        • Repeated images
+        """
+        
+        n_pages = len(self.doc)
+
+        text_counter = defaultdict(set)
+
+        drawing_counter = Counter()
+
+        image_counter = Counter()
+
+        # --------------------------------------------------
+        # Scan every page
+        # --------------------------------------------------
+
+        for page in self.doc:
+            #print(f"  [DEBUG] page {page.number} rotation={page.rotation} rect={page.rect}")
+            content_bbox = self._compute_content_bbox(page)
+
+            self._content_bbox_cache[page.number] = content_bbox
+
+            zone_top = (
+                content_bbox.y0 +
+                self.header_zone_frac * content_bbox.height
+            )
+
+            zone_bottom = (
+                content_bbox.y1 -
+                self.footer_zone_frac * content_bbox.height
+            )
+
+            # ------------------------------------------
+            # TEXT
+            # ------------------------------------------
+
+            for blk in self._get_page_blocks(page):
+
+                x0, y0, x1, y1 = blk["bbox"]
+
+                in_header = y1 <= zone_top
+
+                in_footer = y0 >= zone_bottom
+
+                if not (in_header or in_footer):
+                    continue
+
+                norm = self._normalize_text(blk["text"])
+
+                if len(norm) < 3:
+                    continue
+
+                text_counter[norm].add(page.number)
+
+            # ------------------------------------------
+            # DRAWINGS
+            # ------------------------------------------
+
+            for drawing in self._get_page_drawings(page):
+
+                r = drawing["bbox"]
+
+                in_header = r.y1 <= zone_top
+
+                in_footer = r.y0 >= zone_bottom
+
+                if not (in_header or in_footer):
+                    continue
+
+                key = (
+
+                    round(r.width, 1),
+
+                    round(r.height, 1),
+
+                    round(
+                        (r.x0 - content_bbox.x0) / content_bbox.width,
+                        2,
+                    ),
+
+                    round(
+                        (r.y0 - content_bbox.y0) / content_bbox.height,
+                        2,
+                    ),
+
+                    drawing.get("type", ""),
+
+                )
+
+                drawing_counter[key] += 1
+
+            # ------------------------------------------
+            # IMAGES
+            # ------------------------------------------
+
+            for image in self._get_page_images(page):
+
+                r = image["bbox"]
+
+                in_header = r.y1 <= zone_top
+
+                in_footer = r.y0 >= zone_bottom
+
+                if not (in_header or in_footer):
+                    continue
+
+                # NOTE: normalized the same way as the drawing key
+                # above (offset from content_bbox origin, not raw
+                # position). Previously this used r.x0 / width with
+                # no origin offset, which drifted out of sync with
+                # the drawing key whenever content_bbox.x0 != 0.
+                key = (
+
+                    round(r.width, 1),
+
+                    round(r.height, 1),
+
+                    round(
+                        (r.x0 - content_bbox.x0) / content_bbox.width,
+                        2,
+                    ),
+
+                    round(
+                        (r.y0 - content_bbox.y0) / content_bbox.height,
+                        2,
+                    ),
+
+                )
+
+                image_counter[key] += 1
+
+        # --------------------------------------------------
+        # Determine boilerplate threshold
+        # --------------------------------------------------
+
+        min_pages = max(
+
+            2,
+
+            int(
+
+                self.min_repeat_frac *
+
+                n_pages
+
+            )
+
+        )
+
+        # ------------------------------------------
+        # Text
+        # ------------------------------------------
+
+        self._boilerplate_signatures = {
+
+            sig
+
+            for sig, pages in text_counter.items()
+
+            if len(pages) >= min_pages
+
+        }
+
+        # ------------------------------------------
+        # Drawings
+        # ------------------------------------------
+
+        self._boilerplate_drawings = {
+
+            key
+
+            for key, count in drawing_counter.items()
+
+            if count >= min_pages
+
+        }
+
+        # ------------------------------------------
+        # Images
+        # ------------------------------------------
+
+        self._boilerplate_images = {
+
+            key
+
+            for key, count in image_counter.items()
+
+            if count >= min_pages
+
+        }
+
+        self._analyzed = True
+
+        return {
+
+            "n_pages": n_pages,
+
+            "boilerplate_signatures":
+
+                sorted(self._boilerplate_signatures),
+
+            "n_boilerplate_drawings":
+
+                len(self._boilerplate_drawings),
+
+            "n_boilerplate_images":
+
+                len(self._boilerplate_images),
+
+        }
+
+    # ----------------------------------------------------------
+    # PUBLIC ACCESSORS
+    # ----------------------------------------------------------
+
+    def get_content_bbox(self, page):
+        """
+        Return detected document content rectangle.
+        """
+
+        if not self._analyzed:
+            self.analyze()
+
+        return self._content_bbox_cache.get(
+            page.number,
+            page.rect,
+        )
+
+    # ----------------------------------------------------------
+
+    def get_clean_blocks(self, page):
+        """
+        Return text blocks with repeated
+        headers and footers removed.
+        """
+
+        if not self._analyzed:
+            self.analyze()
+
+        content_bbox = self.get_content_bbox(page)
+
+        zone_top = (
+            content_bbox.y0
+            + self.header_zone_frac
+            * content_bbox.height
+        )
+
+        zone_bottom = (
+            content_bbox.y1
+            - self.footer_zone_frac
+            * content_bbox.height
+        )
+
+        clean = []
+
+        for blk in self._get_page_blocks(page):
+
+            x0, y0, x1, y1 = blk["bbox"]
+
+            in_header = y1 <= zone_top
+
+            in_footer = y0 >= zone_bottom
+
+            if in_header or in_footer:
+
+                norm = self._normalize_text(
+                    blk["text"]
+                )
+
+                if norm in self._boilerplate_signatures:
+                    continue
+
+            clean.append(blk)
+
+        return clean
+
+    # ----------------------------------------------------------
+
+    def get_clean_text(self, page):
+        """
+        Return header/footer-free text.
+        """
+
+        return "\n".join(
+
+            blk["text"]
+
+            for blk in self.get_clean_blocks(page)
+
+        )
+
+    # ----------------------------------------------------------
+
+    def is_boilerplate_drawing(
+        self,
+        drawing,
+        page,
+    ):
+        """
+        Compare drawings using their position
+        relative to the detected document,
+        not the absolute PDF page.
+        """
+
+        bbox = drawing["bbox"]
+
+        content = self.get_content_bbox(page)
+
+        key = (
+
+            round(bbox.width, 1),
+
+            round(bbox.height, 1),
+
+            round(
+                (bbox.x0 - content.x0) / content.width,
+                2,
+            ),
+
+            round(
+                (bbox.y0 - content.y0) / content.height,
+                2,
+            ),
+
+            drawing.get("type", ""),
+
+        )
+
+        return key in self._boilerplate_drawings
+
+    # ----------------------------------------------------------
+
+    def is_boilerplate_image(
+        self,
+        image,
+        page,
+    ):
+        """
+        Check if an image belongs
+        to a repeated header/footer.
+        """
+
+        bbox = image["bbox"]
+
+        content = self.get_content_bbox(page)
+
+        key = (
+
+            round(bbox.width, 1),
+
+            round(bbox.height, 1),
+
+            round(
+                (bbox.x0 - content.x0) / content.width,
+                2,
+            ),
+
+            round(
+                (bbox.y0 - content.y0) / content.height,
+                2,
+            ),
+
+        )
+
+        return key in self._boilerplate_images
+
+    # ----------------------------------------------------------
+
+    def get_header_footer_rects(
+        self,
+        page,
+    ):
+        """
+        Return rectangles occupied by
+        repeated headers/footers.
+
+        Useful for image masking before
+        stitching.
+
+        Covers TEXT boilerplate (titles, doc numbers, page numbers,
+        confidentiality notices, etc.) as well as drawings/images.
+        Text was previously missing here -- which meant this method
+        only ever caught logo images or header/footer rule lines,
+        never the actual repeated header/footer TEXT that makes up
+        most real-world headers and footers.
+        """
+
+        if not self._analyzed:
+            self.analyze()
+
+        rects = []
+
+        content_bbox = self.get_content_bbox(page)
+
+        zone_top = (
+            content_bbox.y0
+            + self.header_zone_frac
+            * content_bbox.height
+        )
+
+        zone_bottom = (
+            content_bbox.y1
+            - self.footer_zone_frac
+            * content_bbox.height
+        )
+
+        for blk in self._get_page_blocks(page):
+
+            x0, y0, x1, y1 = blk["bbox"]
+
+            in_header = y1 <= zone_top
+
+            in_footer = y0 >= zone_bottom
+
+            if not (in_header or in_footer):
+                continue
+
+            norm = self._normalize_text(blk["text"])
+
+            if norm in self._boilerplate_signatures:
+                rects.append(blk["bbox"])
+
+        for d in self._get_page_drawings(page):
+
+            if self.is_boilerplate_drawing(
+                d,
+                page,
+            ):
+                rects.append(d["bbox"])
+
+        for img in self._get_page_images(page):
+
+            if self.is_boilerplate_image(
+                img,
+                page,
+            ):
+                rects.append(img["bbox"])
+
+        return rects
+
+    # ----------------------------------------------------------
+
+    def get_body_bbox(self, page):
+        """
+        Return the content bbox with detected repeated headers and
+        footers excluded from the top and bottom.
+
+        `get_content_bbox()` is a bounding box around EVERYTHING on
+        the page -- headers and footers included, since they're real
+        drawn content. It was never meant to exclude boilerplate on
+        its own. This method additionally trims the top down past
+        whatever boilerplate falls in the header zone, and trims the
+        bottom up above whatever boilerplate falls in the footer
+        zone.
+
+        Use this (not get_content_bbox) for any crop that should NOT
+        include repeated headers/footers -- e.g. before rasterizing a
+        page region for multi-page table/flowchart stitching.
+        """
+
+        if not self._analyzed:
+            self.analyze()
+
+        content = self.get_content_bbox(page)
+
+        zone_top = (
+            content.y0
+            + self.header_zone_frac
+            * content.height
+        )
+
+        zone_bottom = (
+            content.y1
+            - self.footer_zone_frac
+            * content.height
+        )
+
+        header_bottom = content.y0
+        footer_top = content.y1
+
+        for rect in self.get_header_footer_rects(page):
+
+            if rect.y1 <= zone_top:
+                header_bottom = max(header_bottom, rect.y1)
+
+            if rect.y0 >= zone_bottom:
+                footer_top = min(footer_top, rect.y0)
+
+        # Safety caps: never trim past the header/footer zone
+        # fraction itself, even if a boilerplate rect is detected
+        # unusually far into the page (avoids over-cropping real
+        # body content on an unusual layout).
+        body_y0 = min(header_bottom, zone_top)
+        body_y1 = max(footer_top, zone_bottom)
+
+        return fitz.Rect(
+            content.x0,
+            body_y0,
+            content.x1,
+            body_y1,
+        )
+
+    # ----------------------------------------------------------
+
+    def get_cropped_pixmap(
+        self,
+        page,
+        dpi=300,
+    ):
+        """
+        Render only the detected
+        document content.
+
+        This is what your RAG should use
+        instead of page.get_pixmap().
+        """
+
+        bbox = self.get_content_bbox(page)
+
+        return page.get_pixmap(
+
+            clip=bbox,
+
+            dpi=dpi,
+
+            alpha=False,
+
+        )
+
+    # ----------------------------------------------------------
+
+    def get_cropped_image(
+        self,
+        page,
+        dpi=300,
+    ):
+        """
+        Return cropped PIL image.
+        """
+
+        pix = self.get_cropped_pixmap(
+            page,
+            dpi,
+        )
+
+        return Image.open(
+
+            io.BytesIO(
+
+                pix.tobytes("png")
+
+            )
+
+        )
+
+    # ----------------------------------------------------------
+    # CACHE
+    # ----------------------------------------------------------
+
+    def to_cache_dict(self):
+        """
+        Serialize analysis results.
+
+        Useful if the same PDF is processed
+        multiple times.
+        """
+
+        if not self._analyzed:
+            self.analyze()
+
+        return {
+
+            "boilerplate_signatures":
+
+                sorted(self._boilerplate_signatures),
+
+            "boilerplate_drawings":
+
+                list(self._boilerplate_drawings),
+
+            "boilerplate_images":
+
+                list(self._boilerplate_images),
+
+            "content_bboxes": {
+
+                str(page):
+
+                    [
+
+                        rect.x0,
+                        rect.y0,
+                        rect.x1,
+                        rect.y1,
+
+                    ]
+
+                for page, rect in self._content_bbox_cache.items()
+
+            }
+
+        }
+
+    # ----------------------------------------------------------
+
+    @classmethod
+    def from_cache_dict(
+
+        cls,
+
+        doc,
+
+        cache,
+
+        **kwargs,
+
+    ):
+
+        cleaner = cls(
+
+            doc,
+
+            **kwargs,
+
+        )
+
+        cleaner._boilerplate_signatures = set(
+
+            cache.get(
+
+                "boilerplate_signatures",
+
+                []
+
+            )
+
+        )
+
+        cleaner._boilerplate_drawings = {
+
+            tuple(x)
+
+            for x in cache.get(
+
+                "boilerplate_drawings",
+
+                []
+
+            )
+
+        }
+
+        cleaner._boilerplate_images = {
+
+            tuple(x)
+
+            for x in cache.get(
+
+                "boilerplate_images",
+
+                []
+
+            )
+
+        }
+
+        cleaner._content_bbox_cache = {
+
+            int(page):
+
+                fitz.Rect(*bbox)
+
+            for page, bbox
+
+            in cache.get(
+
+                "content_bboxes",
+
+                {}
+
+            ).items()
+
+        }
+
+        cleaner._analyzed = True
+
+        return cleaner
+
+    # ----------------------------------------------------------
+
+    def clear_cache(self):
+
+        """
+        Force re-analysis.
+        """
+
+        self._content_bbox_cache.clear()
+
+        self._page_blocks_cache.clear()
+
+        self._page_drawings_cache.clear()
+
+        self._page_images_cache.clear()
+
+        self._boilerplate_signatures.clear()
+
+        self._boilerplate_drawings.clear()
+
+        self._boilerplate_images.clear()
+
+        self._analyzed = False
