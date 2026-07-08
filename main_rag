@@ -1,0 +1,2436 @@
+import os
+import json
+import faiss
+import fitz
+import numpy as np
+import re
+import hashlib
+import traceback
+from pathlib import Path
+from collections import defaultdict
+from sentence_transformers import SentenceTransformer
+from groq import Groq
+from rank_bm25 import BM25Okapi
+from PIL import Image
+
+from HEAD import PDFLayoutCleaner
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+PDF_FOLDER  = "pdfs"
+EMBED_MODEL = "BAAI/bge-base-en-v1.5"
+
+TOP_K   = 50
+FINAL_K = 10
+
+CHUNKS_FILE     = "trial_11_chunks.json"
+INDEX_FILE      = "trial_11_index.faiss"
+IMAGE_MAP_FILE  = "trial_11_image_map.json"
+PROCESSED_FILES = "processed_11_files.json"
+IMAGES_FOLDER   = "trial_11_section_images"
+
+# per-PDF PDFLayoutCleaner analysis cache (content bbox per page + detected
+# header/footer boilerplate signatures), persisted so repeated runs don't
+# re-analyze a PDF that hasn't changed. Same file name as before; contents
+# now come from PDFLayoutCleaner.to_cache_dict() instead of a single
+# (header_bottom, footer_top) float pair.
+HEADER_FOOTER_MAP_FILE = "trial2_header_footer_map.json"
+
+# in-memory cache so a single process run doesn't re-open/re-analyze the
+# same PDF multiple times (e.g. once during chunking, once during image
+# extraction)
+_LAYOUT_CLEANER_CACHE: dict[str, PDFLayoutCleaner] = {}
+
+# persists LAST_UPLOADED_FILE across process restarts. Previously this
+# lived only in the in-memory global below, so it reset to None every time
+# the script restarted — which meant the visual-section disambiguation
+# fallback in detect_file_filter() almost never had a useful default to
+# fall back on outside of a single long-running session.
+LAST_UPLOADED_STATE_FILE = "trial2_last_uploaded.json"
+
+GROQ_API_KEY = "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"
+LLM_MODEL    = "llama-3.3-70b-versatile"
+
+IMAGE_DPI = 150
+
+# Sections whose content should be rendered as images
+VISUAL_SECTIONS = {"RACI", "SIPOC", "Overall Process Flow Chart"}
+
+# Table-based sections
+TABLE_SECTIONS = {"RACI", "SIPOC"}
+
+# Flowchart sections
+FLOWCHART_SECTIONS = {"Overall Process Flow Chart"}
+
+BOTTOM_BLEED_PX     = 8
+OVERLAP_PX          = 6
+MIN_CONTENT_HEIGHT  = 30
+NEXT_HEADING_GAP_PX = 4   # gap left above a detected next-section heading
+
+# PDFLayoutCleaner tuning (content-area + header/footer boilerplate detection —
+# see pdf_layout_cleaner.py). Zones are fractions of each page's OWN detected
+# content bbox, not the full page, so this still works when content is
+# shifted/offset within non-standard page layouts.
+LAYOUT_HEADER_ZONE_FRAC = 0.15
+LAYOUT_FOOTER_ZONE_FRAC = 0.15
+LAYOUT_MIN_REPEAT_FRAC  = 0.5
+
+MIN_TABLE_AREA_FRACTION = 0.05
+
+# Minimum words required for a NON-visual section chunk to be kept.
+# Visual sections (RACI / SIPOC / flowchart) bypass this so that
+# image-only / text-sparse sections still register their page range.
+MIN_CHUNK_WORDS = 10
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tracks the most recently uploaded/added PDF so that unqualified
+# queries (e.g. "show me the RACI matrix") right after an upload default
+# to THAT file instead of falling through to "search everything", which
+# was the root cause of tables/flowcharts from other SOPs bleeding in.
+# Backed by LAST_UPLOADED_STATE_FILE so it survives restarts.
+# ─────────────────────────────────────────────────────────────────────────────
+LAST_UPLOADED_FILE: str | None = None
+
+
+def _save_last_uploaded(name: str | None) -> None:
+    with open(LAST_UPLOADED_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last": name}, f)
+
+
+def _load_last_uploaded() -> str | None:
+    if os.path.exists(LAST_UPLOADED_STATE_FILE):
+        with open(LAST_UPLOADED_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f).get("last")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION HEADERS
+# ─────────────────────────────────────────────────────────────────────────────
+SECTION_HEADERS = [
+    "Purpose", "Scope", "Abbreviations", "Terms and Definitions",
+    "Responsibilities", "RACI", "SIPOC", "Overall Process Flow Chart",
+    "Process Description", "Information Security requirements",
+    "References", "Metrics", "Annexures",
+]
+
+SECTION_PATTERN = re.compile(
+    r"^\s*(\d+(?:\.\d+)*)?\s*[\.\)\:]?\s*(" +
+    "|".join(map(re.escape, SECTION_HEADERS)) +
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+INLINE_HEADER_PATTERN = re.compile(
+    r"(?i)^(" + "|".join(map(re.escape, SECTION_HEADERS)) + r")\s*",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VISUAL SECTION ALIASES
+# ─────────────────────────────────────────────────────────────────────────────
+VISUAL_SECTION_ALIASES = {
+    "raci":                    "RACI",
+    "responsible":             "RACI",
+    "accountable":             "RACI",
+    "consulted":               "RACI",
+    "informed":                "RACI",
+    "responsibility matrix":   "RACI",
+    "responsibilities matrix": "RACI",
+    "who is responsible":      "RACI",
+    "who does what":           "RACI",
+    "who is accountable":      "RACI",
+    "sipoc":            "SIPOC",
+    "supplier":         "SIPOC",
+    "suppliers":        "SIPOC",
+    "process inputs":   "SIPOC",
+    "process outputs":  "SIPOC",
+    "process overview": "SIPOC",
+    "overall process flow chart": "Overall Process Flow Chart",
+    "overall process flowchart": "Overall Process Flow Chart",
+    "process flow":               "Overall Process Flow Chart",
+    "flow chart":                 "Overall Process Flow Chart",
+    "flowchart":                  "Overall Process Flow Chart",
+    "process diagram":            "Overall Process Flow Chart",
+    "workflow":                   "Overall Process Flow Chart",
+    "flow diagram":               "Overall Process Flow Chart",
+    "process map":                "Overall Process Flow Chart",
+}
+
+SECTION_NAMES_LOWER = [s.lower() for s in SECTION_HEADERS]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY-INTENT DETECTION (shared by retrieve() and build_prompt())
+# ─────────────────────────────────────────────────────────────────────────────
+_DOC_REF = r"(this|the)\s+(document|doc|sop|file|process|procedure)"
+SUMMARY_PATTERN = re.compile(
+    r"\b(summary|summarise|summarize|overview)\b"
+    r"|\btell me about\s+" + _DOC_REF +
+    r"|\bwhat\s+(is|does)\s+" + _DOC_REF + r"\s+(about|cover|say)"
+    r"|\b(describe|explain)\s+" + _DOC_REF,
+    re.IGNORECASE,
+)
+
+def _is_summary_query(query: str) -> bool:
+    return bool(SUMMARY_PATTERN.search(query))
+
+
+def _detect_visual_section(query: str) -> str | None:
+    q = query.lower()
+    for keyword in sorted(VISUAL_SECTION_ALIASES, key=len, reverse=True):
+        if keyword in q:
+            return VISUAL_SECTION_ALIASES[keyword]
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERAL QUESTION DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Questions that usually require searching across MANY SOPs
+GENERAL_PATTERNS = [
+
+    "what is",
+    "what are",
+    "who is",
+    "who are",
+
+    "define",
+    "definition",
+
+    "describe",
+    "explain",
+
+    "meaning of",
+    "stands for",
+    "full form",
+
+    "purpose of",
+    "responsibilities",
+    "roles",
+    "duties",
+
+    "objective",
+    "benefits",
+    "advantages",
+
+    "process of",
+    "workflow of",
+
+    "how does",
+    "how do",
+
+    "when is",
+    "why is",
+
+]
+
+
+def is_general_question(
+    query: str,
+    chunks: list[dict],
+) -> bool:
+    """
+    Decide whether the query is asking about
+    a GENERAL CONCEPT or about one specific SOP.
+
+    Examples
+    --------
+
+    What is schematic design?
+        -> True
+
+    Responsibilities of Project Manager
+        -> True
+
+    What is SIPOC?
+        -> True
+
+    Show RACI matrix
+        -> False (visual section)
+
+    Summarize this SOP
+        -> False
+
+    Explain Building Permit SOP
+        -> False
+    """
+
+    q = query.lower().strip()
+
+    # -------------------------------------------------------
+    # If the user clearly mentioned a filename,
+    # this is NOT a generalized search.
+    # -------------------------------------------------------
+
+    if detect_file_filter(query, chunks) is not None:
+        return False
+
+    # -------------------------------------------------------
+    # Summary requests are document-specific.
+    # -------------------------------------------------------
+
+    if _is_summary_query(query):
+        return False
+
+    # -------------------------------------------------------
+    # Visual sections should use the existing pipeline.
+    # -------------------------------------------------------
+
+    if _detect_visual_section(query):
+        return False
+
+    # -------------------------------------------------------
+    # Section names should use existing retrieval.
+    # -------------------------------------------------------
+
+    for sec in SECTION_NAMES_LOWER:
+
+        if sec in q:
+
+            return False
+
+    # -------------------------------------------------------
+    # General question patterns
+    # -------------------------------------------------------
+
+    for pattern in GENERAL_PATTERNS:
+
+        if pattern in q:
+
+            return True
+
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCUMENT GROUPING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+from collections import defaultdict
+
+
+def group_chunks_by_document(retrieved_chunks):
+    """
+    Groups retrieved chunks by PDF.
+
+    Returns
+
+    {
+        file1.pdf : [chunk1, chunk2, ...],
+        file2.pdf : [chunk3, chunk4, ...]
+    }
+    """
+
+    grouped = defaultdict(list)
+
+    for chunk in retrieved_chunks:
+
+        grouped[chunk["file_name"]].append(chunk)
+
+    return grouped
+
+
+def rank_documents(grouped_chunks):
+    """
+    Rank documents instead of chunks.
+
+    Score =
+        Average relevance
+      + Number of matching chunks
+      + Best chunk score
+    """
+
+    ranked = []
+
+    for file_name, docs in grouped_chunks.items():
+
+        scores = [c["score"] for c in docs]
+
+        avg_score = np.mean(scores)
+
+        best_score = max(scores)
+
+        match_count = len(docs)
+
+        document_score = (
+
+            avg_score * 0.50 +
+
+            best_score * 0.30 +
+
+            min(match_count / 10, 1.0) * 0.20
+
+        )
+
+        ranked.append({
+
+            "file_name": file_name,
+
+            "chunks": docs,
+
+            "matches": match_count,
+
+            "avg_score": avg_score,
+
+            "best_score": best_score,
+
+            "document_score": document_score,
+
+        })
+
+    ranked.sort(
+
+        key=lambda x: x["document_score"],
+
+        reverse=True,
+
+    )
+
+    return ranked
+
+
+
+def select_chunks_per_document(
+
+    ranked_documents,
+
+    max_chunks=5,
+
+):
+
+    """
+    Keep the best chunks from EVERY document.
+
+    No document can dominate retrieval.
+    """
+
+    selected = []
+
+    for doc in ranked_documents:
+
+        ordered = sorted(
+
+            doc["chunks"],
+
+            key=lambda x: x["score"],
+
+            reverse=True,
+
+        )
+
+        selected.extend(
+
+            ordered[:max_chunks]
+
+        )
+
+    return selected
+
+
+
+
+def print_matching_documents(ranked_documents):
+    """
+    Prints all PDFs contributing to the answer.
+
+    Example
+
+    Found information in 8 SOPs
+
+    1. Project.pdf
+       6 matching chunks
+
+    2. Design.pdf
+       4 matching chunks
+    """
+
+    if not ranked_documents:
+        return
+
+    print()
+
+    print("=" * 60)
+
+    print(
+        f"Found information in {len(ranked_documents)} SOP(s)\n"
+    )
+
+    for i, doc in enumerate(ranked_documents, 1):
+
+        print(
+
+            f"{i}. {doc['file_name']}"
+
+            f" ({doc['matches']} matching chunk(s), "
+
+            f"score={doc['avg_score']:.3f})"
+
+        )
+
+    print("=" * 60)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+def load_pdfs(folder: str) -> list[dict]:
+    """
+    Loads and text-extracts every PDF in `folder`.
+
+    Wrapped per-file in try/except: previously an exception analyzing ANY
+    single PDF (e.g. the UnboundLocalError-style crashes seen while
+    debugging PDFLayoutCleaner) would abort the whole loop, silently
+    dropping every PDF that came after the broken one — which is exactly
+    the kind of thing that makes RACI/SIPOC/flowchart images "just not
+    show up" for some PDFs with no clear reason. Now a broken PDF is
+    logged with a full traceback and skipped, and every other PDF still
+    gets processed.
+    """
+    docs = []
+    layout_cache_json = load_layout_cache_json()
+
+    for file in sorted(Path(folder).glob("*.pdf")):
+        try:
+            pdf     = fitz.open(str(file))
+            cleaner = get_layout_cleaner(pdf, file.name, layout_cache_json)
+            pages   = []
+            for i in range(len(pdf)):
+                # get_clean_text() drops repeated header/footer boilerplate
+                # (title, doc number, version, page numbers, dates,
+                # confidentiality text, etc.) detected from the page's OWN
+                # content area — not a fixed-coordinate crop — so it holds up
+                # even on pages where content is shifted within the page.
+                text = cleaner.get_clean_text(pdf[i]).strip()
+                # Always track the page, even if it has no extractable
+                # text. Table/flowchart continuation pages are often mostly a
+                # graphic with little or no text — dropping them here means
+                # they can never appear in a visual section's page range, which
+                # was silently truncating multi-page RACI/SIPOC/flowchart crops.
+                pages.append({"page": i + 1, "text": text})
+            pdf.close()
+            if pages:
+                docs.append({"file_name": file.name, "pages": pages})
+        except Exception as e:
+            print(f"\n  [ERROR] Failed to load/analyze '{file.name}': {e}")
+            traceback.print_exc()
+            print(f"  [SKIP] Continuing with remaining PDFs...\n")
+            continue
+
+    save_layout_cache_json(layout_cache_json)
+    print(f"  Loaded {len(docs)} PDF(s) from '{folder}'")
+    return docs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER / FOOTER CLEANING (TEXT CHUNKS)
+# ─────────────────────────────────────────────────────────────────────────────
+def clean_chunk_text(text: str) -> str:
+    lines   = text.splitlines()
+    cleaned = [l for l in lines if not INLINE_HEADER_PATTERN.match(l.strip())]
+    return " ".join(" ".join(cleaned).split()).strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHUNKING
+# ─────────────────────────────────────────────────────────────────────────────
+def chunk_documents(docs):
+    chunks   = []
+    chunk_id = 0
+
+    MAX_SECTION_WORDS = 700
+    CHUNK_OVERLAP     = 100
+
+    for doc in docs:
+        file_name        = doc["file_name"]
+        all_page_numbers = [p["page"] for p in doc["pages"]]
+
+        all_lines = []
+        for p in doc["pages"]:
+            for line in p["text"].split("\n"):
+                all_lines.append((p["page"], line))
+
+        current_section = "Cover Page"
+        section_lines   = []
+        section_start   = 1
+        last_page_seen  = 1
+
+        def flush(buf, section, start_page, end_page, next_section_page=None):
+            nonlocal chunk_id
+
+            raw  = " ".join(" ".join(buf).split()).strip()
+            text = clean_chunk_text(raw)
+            words = text.split()
+
+            is_visual = section in VISUAL_SECTIONS
+
+            if len(words) < MIN_CHUNK_WORDS and not is_visual:
+                return
+
+            # Visual sections (RACI / SIPOC / flowchart) get their
+            # page range from the SECTION BOUNDARIES (start_page →
+            # next_section_page - 1, or the doc's last page if this is the
+            # final section) instead of from `end_page` (= last_page_seen).
+            # `last_page_seen` only advances on lines with actual text, so a
+            # near-blank continuation page (common for table/flowchart pages)
+            # never bumps it — which was silently truncating the page range
+            # and breaking multi-page crops / dropping sections whose only
+            # content is on a text-sparse page.
+            if is_visual:
+                if next_section_page is not None:
+                    range_end = next_section_page   # inclusive — the
+                    # table/flowchart may genuinely continue onto the same
+                    # page the next section's heading starts on. We keep
+                    # that page and let _find_next_section_top() (in the
+                    # crop functions) clip it above the next heading,
+                    # instead of discarding the whole page and losing
+                    # content that was legitimately part of this section.
+                else:
+                    range_end = max(all_page_numbers, default=start_page)
+                range_end = max(range_end, start_page)
+                all_pages = list(range(start_page, range_end + 1))
+            else:
+                all_pages = [p for p in all_page_numbers if start_page <= p <= end_page]
+                if not all_pages:
+                    all_pages = [start_page]
+
+                if (
+                    next_section_page is not None
+                    and all_pages
+                    and all_pages[-1] == next_section_page
+                ):
+                    all_pages = all_pages[:-1]
+
+                if not all_pages:
+                    all_pages = [start_page]
+
+            if is_visual and len(words) < MIN_CHUNK_WORDS:
+                placeholder_text = text if text else f"{section} section (visual content)."
+                chunks.append({
+                    "chunk_id":   chunk_id,
+                    "text":       placeholder_text,
+                    "file_name":  file_name,
+                    "page":       start_page,
+                    "all_pages":  all_pages,
+                    "page_end":   all_pages[-1],
+                    "section":    section,
+                    "word_count": len(words),
+                })
+                chunk_id += 1
+                return
+
+            if len(words) <= MAX_SECTION_WORDS:
+                chunks.append({
+                    "chunk_id":   chunk_id,
+                    "text":       text,
+                    "file_name":  file_name,
+                    "page":       start_page,
+                    "all_pages":  all_pages,
+                    "page_end":   all_pages[-1],
+                    "section":    section,
+                    "word_count": len(words),
+                })
+                chunk_id += 1
+                return
+
+            step = MAX_SECTION_WORDS - CHUNK_OVERLAP
+            for start in range(0, len(words), step):
+                chunk_words = words[start:start + MAX_SECTION_WORDS]
+                if len(chunk_words) < MIN_CHUNK_WORDS:
+                    break
+                chunks.append({
+                    "chunk_id":   chunk_id,
+                    "text":       " ".join(chunk_words),
+                    "file_name":  file_name,
+                    "page":       start_page,
+                    "all_pages":  all_pages,
+                    "page_end":   all_pages[-1],
+                    "section":    section,
+                    "word_count": len(chunk_words),
+                })
+                chunk_id += 1
+
+        for page_num, line in all_lines:
+            line = line.strip()
+            if not line:
+                continue
+            if page_num > last_page_seen:
+                last_page_seen = page_num
+
+            match = SECTION_PATTERN.match(line)
+            if match:
+                flush(
+                    section_lines, current_section,
+                    section_start, last_page_seen,
+                    next_section_page=page_num,
+                )
+                current_section = match.group(2)
+                section_lines   = []
+                section_start   = page_num
+                last_page_seen  = page_num
+            else:
+                section_lines.append(line)
+
+        flush(section_lines, current_section, section_start, last_page_seen)
+
+    print(f"Created {len(chunks)} chunk(s)")
+    if chunks:
+        print("Largest chunk:", max(c["word_count"] for c in chunks))
+    return chunks
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHUNK CACHE
+# ─────────────────────────────────────────────────────────────────────────────
+def save_chunks(chunks):
+    with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2)
+
+def load_chunks():
+    with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INCREMENTAL PDF TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+def file_hash(filepath):
+    with open(filepath, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+def load_processed():
+    if os.path.exists(PROCESSED_FILES):
+        with open(PROCESSED_FILES, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_processed(data):
+    with open(PROCESSED_FILES, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_new_pdfs():
+    processed = load_processed()
+    new_files = []
+    for pdf in Path(PDF_FOLDER).glob("*.pdf"):
+        current_hash = file_hash(pdf)
+        if processed.get(pdf.name) != current_hash:
+            new_files.append(pdf)
+    return new_files
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FAISS INDEX
+# ─────────────────────────────────────────────────────────────────────────────
+def _chunk_to_text(c):
+    return (
+        f"File: {c['file_name']}\n"
+        f"Section: {c['section']}\n\n"
+        f"{c['text']}"
+    )
+
+def build_index(chunks, model):
+    texts = [_chunk_to_text(c) for c in chunks]
+    emb   = model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=True)
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(np.array(emb, dtype="float32"))
+    faiss.write_index(index, INDEX_FILE)
+    return index
+
+def build_sub_index(model, chunks):
+    texts = [_chunk_to_text(c) for c in chunks]
+    emb   = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(np.array(emb, dtype="float32"))
+    return index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BM25
+# ─────────────────────────────────────────────────────────────────────────────
+def build_bm25(chunks):
+    corpus = [
+        (c["section"] + " " + c["file_name"] + " " + c["text"]).lower().split()
+        for c in chunks
+    ]
+    return BM25Okapi(corpus)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+def _normalise(s: str) -> str:
+    return re.sub(r"[\s\-_]+", " ", Path(s).stem.lower()).strip()
+
+def _meaningful_tokens(s: str) -> list[str]:
+    return [t for t in s.split() if len(t) > 2]
+
+# Generic filename words that show up across many SOP files and shouldn't,
+# on their own, count as evidence that a SPECIFIC file was named. Matching
+# only on words like these is exactly how an unrelated file could win the
+# old raw-count check (best_score >= 2): e.g. two totally different SOPs
+# both containing "sop" and "final" would tie/overlap on those words alone.
+GENERIC_FILE_WORDS = {
+    "sop", "pdf", "doc", "docx", "document", "file", "files",
+    "final", "draft", "copy", "rev", "revision", "revised",
+    "version", "ver", "v", "update", "updated", "new", "old",
+    "latest", "master", "template",
+}
+
+def _distinctive_tokens(tokens: list[str]) -> list[str]:
+    """
+    Strip generic filler words and pure numbers (e.g. 'v2' -> '2' already
+    dropped by GENERIC_FILE_WORDS covering 'v'; standalone digit tokens
+    like version numbers are dropped too) so what's left is the part of
+    the filename that actually identifies WHICH document this is.
+    Falls back to the full token list if a filename is made up entirely
+    of generic words, so we never end up with zero tokens to match on.
+    """
+    distinctive = [
+        t for t in tokens
+        if t not in GENERIC_FILE_WORDS and not t.isdigit()
+    ]
+    return distinctive if distinctive else tokens
+
+
+def _file_match_ratio(file_name: str, q_norm: str) -> tuple[float, int]:
+    """
+    Returns (coverage_ratio, num_distinctive_tokens) describing how much of
+    THIS file's distinctive name-tokens are actually present in the query,
+    using word-boundary matching (so 'sop' doesn't match inside a longer
+    word like 'sophisticated', and short tokens don't false-hit on
+    substrings of unrelated words).
+    """
+    tokens      = _meaningful_tokens(_normalise(file_name))
+    distinctive = _distinctive_tokens(tokens)
+    matched = [
+        t for t in distinctive
+        if re.search(rf"\b{re.escape(t)}\b", q_norm)
+    ]
+    ratio = len(matched) / len(distinctive) if distinctive else 0.0
+    return ratio, len(distinctive)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AMBIGUOUS DOCUMENT DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+# def detect_ambiguous_documents(query: str, chunks: list[dict]):
+#     """
+#     Checks whether the user's query refers to multiple SOPs.
+
+#     Returns:
+#         None                  -> no ambiguity
+#         [file1, file2, ...]   -> multiple matching files
+#     """
+
+#     q = _normalise(query)
+
+#     files = sorted(set(c["file_name"] for c in chunks))
+
+#     matches = []
+
+#     for file in files:
+
+#         ratio, _ = _file_match_ratio(file, q)
+
+#         # Ignore tiny accidental matches
+#         if ratio >= 0.25:
+#             matches.append((file, ratio))
+
+#     # Highest match first
+#     matches.sort(key=lambda x: x[1], reverse=True)
+
+#     if len(matches) <= 1:
+#         return None
+
+#     # If one file is clearly better, don't ask
+#     if matches[0][1] - matches[1][1] >= 0.30:
+#         return None
+
+#     return [m[0] for m in matches]
+
+
+def detect_ambiguous_documents(query, chunks):
+
+    query_lower = query.lower()
+
+    matched = []
+
+    for filename in set(c["file_name"] for c in chunks):
+
+        stem = Path(filename).stem.lower()
+
+        if stem in query_lower:
+            matched.append(filename)
+
+    return matched
+
+
+def detect_file_filter(
+    query: str,
+    chunks: list[dict],
+    default_file: str | None = None,
+) -> str | None:
+    q_norm = _normalise(query)
+    files  = list({c["file_name"] for c in chunks})
+
+    # ── Coverage-ratio name match ───────────────────────────────────────
+    ratios = {f: _file_match_ratio(f, q_norm) for f in files}
+    ranked = sorted(ratios.items(), key=lambda kv: (kv[1][0], kv[1][1]), reverse=True)
+
+    if ranked:
+        best_file, (best_ratio, best_n) = ranked[0]
+        second_ratio = ranked[1][1][0] if len(ranked) > 1 else 0.0
+        margin = best_ratio - second_ratio
+
+        print(f"[file_filter] Coverage ratios: "
+              f"{[(f, round(r, 2)) for f, (r, _) in ranked[:5]]}")
+
+        if best_ratio >= 0.6 and margin >= 0.25:
+            print(f"[file_filter] Confident name match "
+                  f"(ratio={best_ratio:.2f}, margin={margin:.2f}) → {best_file}")
+            return best_file
+
+    def _bow(text: str) -> dict:
+        toks = text.split()
+        bag: dict[str, int] = {}
+        for t in toks:
+            bag[t] = bag.get(t, 0) + 1
+        for i in range(len(toks) - 1):
+            bg = toks[i] + "_" + toks[i + 1]
+            bag[bg] = bag.get(bg, 0) + 1
+        return bag
+
+    q_bow = _bow(q_norm)
+
+    def _cosine(a: dict, b: dict) -> float:
+        shared = sum(a.get(k, 0) * v for k, v in b.items())
+        norm_a = sum(v * v for v in a.values()) ** 0.5
+        norm_b = sum(v * v for v in b.values()) ** 0.5
+        return shared / (norm_a * norm_b + 1e-9)
+
+    sim_scores  = {f: _cosine(q_bow, _bow(_normalise(f))) for f in files}
+    top_file    = max(sim_scores, key=sim_scores.get)
+    top_sim     = sim_scores[top_file]
+    sorted_sims = sorted(sim_scores.values(), reverse=True)
+    margin      = (sorted_sims[0] - sorted_sims[1]) if len(sorted_sims) > 1 else sorted_sims[0]
+
+    if top_sim > 0.15 and margin > 0.05:
+        print(f"[file_filter] Cosine sim ({top_sim:.3f}, margin {margin:.3f}) → {top_file}")
+        return top_file
+
+    # ── Visual section fallback ─────────────────────────────────────────────
+    visual_section = _detect_visual_section(query)
+    if visual_section:
+        files_with_section = list({
+            c["file_name"] for c in chunks
+            if c["section"] == visual_section
+        })
+        if default_file and default_file in files_with_section:
+            print(f"[file_filter] Visual section + last uploaded → {default_file}")
+            return default_file
+        if len(files_with_section) == 1:
+            print(f"[file_filter] Single-file visual section → {files_with_section[0]}")
+            return files_with_section[0]
+        if len(files_with_section) > 1:
+            candidate_sims = {f: sim_scores.get(f, 0.0) for f in files_with_section}
+            best_candidate = max(candidate_sims, key=candidate_sims.get)
+            print(f"[file_filter] Ambiguous visual section across "
+                  f"{len(files_with_section)} files — best guess → {best_candidate}")
+            return best_candidate
+
+    if default_file and default_file in files:
+        print(f"[file_filter] No confident match — defaulting to last uploaded: {default_file}")
+        return default_file
+
+    print("[file_filter] No confident match → searching all files")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAGE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _page_content_rect(page: fitz.Page, cleaner: "PDFLayoutCleaner") -> fitz.Rect:
+    """
+    This page's real BODY content area -- header/footer strips excluded --
+    detected by PDFLayoutCleaner from the actual text/drawings/images on
+    the page, not a fixed offset.
+
+    IMPORTANT: this calls get_body_bbox(), not get_content_bbox().
+    get_content_bbox() is a bounding box around EVERYTHING on the page,
+    including headers and footers -- they're real drawn content, so they
+    were never excluded from it. That mismatch (comment said "excluded",
+    code returned "included") is exactly why headers/footers were still
+    showing up in stitched table/flowchart images: the crop's top/bottom
+    bounds were being computed from a box that already extended from the
+    header down to the footer. get_body_bbox() additionally trims past
+    whatever boilerplate PDFLayoutCleaner detected in the header/footer
+    zones, so the crop actually starts/ends at real body content.
+    """
+    return cleaner.get_body_bbox(page)
+
+
+# ── per-PDF content-area + header/footer auto-detection ────────────────────
+# (delegated to pdf_layout_cleaner.PDFLayoutCleaner — see that module for the
+# two-pass algorithm: content bbox per page, then boilerplate signatures
+# that recur across a majority of pages within each page's own header/
+# footer zone.)
+
+def load_layout_cache_json() -> dict:
+    if os.path.exists(HEADER_FOOTER_MAP_FILE):
+        with open(HEADER_FOOTER_MAP_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_layout_cache_json(cache_json: dict) -> None:
+    with open(HEADER_FOOTER_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache_json, f, indent=2)
+
+
+def get_layout_cleaner(
+    pdf: fitz.Document,
+    file_name: str,
+    cache_json: dict | None = None,
+) -> "PDFLayoutCleaner":
+    """
+    Cached wrapper around PDFLayoutCleaner — analyzes a PDF once per file
+    and reuses the result. Checks the in-memory cache first, then the
+    on-disk JSON cache (cache_json, typically loaded once per run via
+    load_layout_cache_json()), and only re-runs the analysis if neither
+    has it. When cache_json is supplied, freshly-analyzed results are
+    written back into it so the caller can persist them.
+    """
+    if file_name in _LAYOUT_CLEANER_CACHE:
+        return _LAYOUT_CLEANER_CACHE[file_name]
+
+    kwargs = dict(
+        header_zone_frac=LAYOUT_HEADER_ZONE_FRAC,
+        footer_zone_frac=LAYOUT_FOOTER_ZONE_FRAC,
+        min_repeat_frac=LAYOUT_MIN_REPEAT_FRAC,
+    )
+
+    if cache_json is not None and file_name in cache_json:
+        cleaner = PDFLayoutCleaner.from_cache_dict(pdf, cache_json[file_name], **kwargs)
+    else:
+        cleaner = PDFLayoutCleaner(pdf, **kwargs)
+        cleaner.analyze()
+        if cache_json is not None:
+            cache_json[file_name] = cleaner.to_cache_dict()
+
+    _LAYOUT_CLEANER_CACHE[file_name] = cleaner
+    return cleaner
+
+
+def _find_heading_bottom(page: fitz.Page, section_name: str, content: fitz.Rect) -> float:
+    GAP = 8  # breathing room below the heading line
+
+    hits = page.search_for(section_name)
+    if hits:
+        return max(content.y0, max(h.y1 for h in hits) + GAP)
+
+    needle   = section_name.lower().strip()
+    best_y1  = None
+    best_len = None
+
+    for block in page.get_text("blocks"):
+        if len(block) < 5 or block[6] != 0:   # skip image blocks
+            continue
+        block_text = block[4].strip().lower()
+        if needle in block_text:
+            by1 = block[3]
+            blen = len(block_text)
+            if best_y1 is None or by1 < best_y1 or (by1 == best_y1 and blen < best_len):
+                best_y1  = by1
+                best_len = blen
+
+    if best_y1 is not None:
+        return max(content.y0, best_y1 + GAP)
+
+    return content.y0   # safe fallback
+
+
+# ── find where the NEXT section heading starts on this page ────────────────
+def _find_next_section_top(
+    page: fitz.Page,
+    current_section: str,
+    after_y: float,
+) -> float | None:
+    best_top = None
+    current_norm = current_section.strip().lower()
+
+    for block in page.get_text("blocks"):
+        if len(block) < 5 or block[6] != 0:   # skip image blocks
+            continue
+        bx0, by0, bx1, by1, btext = block[0], block[1], block[2], block[3], block[4]
+        if by0 <= after_y + 1:
+            continue
+        for line in btext.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = SECTION_PATTERN.match(line)
+            if m and m.group(2).strip().lower() != current_norm:
+                if best_top is None or by0 < best_top:
+                    best_top = by0
+                break
+
+    return best_top
+
+
+def _rasterise_rect(page: fitz.Page, rect: fitz.Rect, dpi: int = IMAGE_DPI) -> Image.Image:
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, clip=rect, colorspace=fitz.csRGB)
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+
+def _rasterise_fallback(page: fitz.Page, dpi: int = IMAGE_DPI) -> Image.Image:
+    """
+    Guaranteed fallback for rendering a page region.
+
+    Used whenever a computed content-area crop is too small/degenerate to
+    trust (content.height < MIN_CONTENT_HEIGHT). Previously those pages
+    were simply skipped (`continue`), which meant that if a table or
+    flowchart happened to be drawn with faint vector lines or a
+    low-contrast image that PDFLayoutCleaner's bbox detection missed, the
+    page contributed NOTHING to the stitched image — and if that happened
+    on every page in a section's range, no image got saved at all. This
+    guarantees SOME image is produced (the whole page, uncropped) rather
+    than silently dropping the section.
+    """
+    return _rasterise_rect(page, page.rect, dpi)
+
+
+def _stitch_vertical(page_images: list[Image.Image]) -> Image.Image:
+    if len(page_images) == 1:
+        return page_images[0]
+    total_w = max(img.width  for img in page_images)
+    total_h = sum(img.height for img in page_images)
+    canvas  = Image.new("RGB", (total_w, total_h), color=(255, 255, 255))
+    y = 0
+    for img in page_images:
+        x = (total_w - img.width) // 2
+        canvas.paste(img, (x, y))
+        y += img.height
+    return canvas
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABLE CROP  (RACI / SIPOC)
+# ─────────────────────────────────────────────────────────────────────────────
+def _rasterise_table_crops(
+    pdf:          fitz.Document,
+    all_pages:    list[int],
+    section_name: str,
+    cleaner:      "PDFLayoutCleaner",
+    dpi:          int = IMAGE_DPI,
+) -> Image.Image | None:
+    crops: list[Image.Image] = []
+    last_idx = len(all_pages) - 1
+
+    for page_idx, page_num in enumerate(all_pages):
+        pdf_page_index = page_num - 1
+        if pdf_page_index >= len(pdf):
+            continue
+
+        page    = pdf[pdf_page_index]
+        content = _page_content_rect(page, cleaner)
+
+        if content.height < MIN_CONTENT_HEIGHT:
+            # Previously: print [SKIP] and `continue`, dropping this page
+            # entirely. Now: fall back to rasterising the WHOLE page so the
+            # table/flowchart still shows up (uncropped) instead of the
+            # section silently losing this page's content — and, in the
+            # worst case where every page in the range hits this branch,
+            # instead of no image being produced at all.
+            print(f"    [FALLBACK] Page {page_num}: content rect too small "
+                  f"({content.height:.0f}pt) — using full page instead of skipping")
+            crops.append(_rasterise_fallback(page, dpi))
+            continue
+
+        if page_idx == 0:
+            top = _find_heading_bottom(page, section_name, content)
+        else:
+            top = max(page.rect.y0, content.y0 - OVERLAP_PX)
+
+        bottom = min(page.rect.y1, content.y1 + BOTTOM_BLEED_PX)
+
+        # Only scan for the next section's heading on the LAST page
+        # of this range. Earlier pages are guaranteed by the chunk-level
+        # page-range calculation to belong fully to THIS section — scanning
+        # them was producing false positives from ordinary words (e.g.
+        # "Responsibilities", "Scope") that show up as swimlane/column
+        # labels inside the table or flowchart itself, wrongly skipping
+        # legitimate continuation pages.
+        is_last_page = (page_idx == last_idx)
+        if is_last_page:
+            next_top = _find_next_section_top(page, section_name, top)
+            if next_top is not None and next_top > top:
+                bottom = min(bottom, next_top - NEXT_HEADING_GAP_PX)
+            if next_top is not None and page_idx > 0 and (next_top - top) < MIN_CONTENT_HEIGHT:
+                print(f"    [SKIP] Page {page_num}: no real '{section_name}' content "
+                      f"before next heading — belongs to next section")
+                continue
+
+        crop = fitz.Rect(content.x0, top, content.x1, bottom)
+
+        if crop.is_empty or crop.height < 10:
+            print(f"    [WARN] Degenerate crop on page {page_num} for "
+                  f"'{section_name}' — using full content area")
+            crop = fitz.Rect(content.x0, content.y0, content.x1, content.y1)
+
+        if crop.is_empty or crop.height < 10:
+            # Even the "full content area" fallback above came back
+            # degenerate (content itself was near-empty) -- last resort is
+            # the whole physical page, so we still produce SOMETHING.
+            print(f"    [FALLBACK] Page {page_num}: content area also "
+                  f"degenerate — using full page")
+            crops.append(_rasterise_fallback(page, dpi))
+            continue
+
+        crops.append(_rasterise_rect(page, crop, dpi))
+
+    return _stitch_vertical(crops) if crops else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLOWCHART CROP
+# ─────────────────────────────────────────────────────────────────────────────
+def _rasterise_flowchart(
+    page:          fitz.Page,
+    section_name:  str,
+    cleaner:       "PDFLayoutCleaner",
+    dpi:           int = IMAGE_DPI,
+    is_first_page: bool = True,
+    is_last_page:  bool = True,           # only the last page of the range can be shared with the next section
+) -> Image.Image:
+    content = _page_content_rect(page, cleaner)
+
+    if content.height < MIN_CONTENT_HEIGHT:
+        # Same fallback reasoning as _rasterise_table_crops: a too-small
+        # detected content rect used to mean this page contributed nothing.
+        # Returning None here (instead of a guaranteed image) is exactly
+        # how a flowchart could end up with NO saved image at all if this
+        # happened on its only page. Render the whole page instead.
+        print(f"    [FALLBACK] Flowchart page: content rect too small "
+              f"({content.height:.0f}pt) — using full page instead of skipping")
+        return _rasterise_fallback(page, dpi)
+
+    if is_first_page:
+        top = _find_heading_bottom(page, section_name, content)
+    else:
+        top = max(page.rect.y0, content.y0 - OVERLAP_PX)
+
+    bottom = min(page.rect.y1, content.y1 + BOTTOM_BLEED_PX)
+
+    # Only scan for the next section's heading on the LAST page of
+    # the range — earlier continuation pages are guaranteed to belong fully
+    # to this section, and scanning them risks false positives from
+    # ordinary words used as labels inside the flowchart itself (e.g. a
+    # swimlane titled "Responsibilities" or "Scope").
+    if is_last_page:
+        next_top = _find_next_section_top(page, section_name, top)
+        if next_top is not None and next_top > top:
+            bottom = min(bottom, next_top - NEXT_HEADING_GAP_PX)
+        if next_top is not None and not is_first_page and (next_top - top) < MIN_CONTENT_HEIGHT:
+            return None
+
+    crop = fitz.Rect(content.x0, top, content.x1, bottom)
+
+    if crop.is_empty or crop.height < 10:
+        crop = fitz.Rect(content.x0, content.y0, content.x1, content.y1)
+
+    if crop.is_empty or crop.height < 10:
+        # Last-resort fallback: whole page, so a degenerate content area
+        # doesn't result in a missing flowchart image.
+        print(f"    [FALLBACK] Flowchart page: content area also "
+              f"degenerate — using full page")
+        return _rasterise_fallback(page, dpi)
+
+    return _rasterise_rect(page, crop, dpi)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAGE EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_section_images(chunks: list[dict]) -> dict[str, str]:
+    """
+    Renders and saves one stitched image per (file, visual section).
+
+    Wrapped per (file, section) in try/except: previously an exception
+    while opening/analyzing/cropping ANY single file's section (the
+    UnboundLocalError-style crash seen while debugging) would propagate
+    all the way up and abort the entire extraction run — silently
+    skipping every remaining file/section that hadn't been processed
+    yet. Now a failure is logged with a full traceback for just that
+    (file, section) pair, and every other pair still gets processed and
+    saved normally.
+    """
+    os.makedirs(IMAGES_FOLDER, exist_ok=True)
+    image_map: dict[str, str] = {}
+
+    # per-PDF layout analysis cache (content bbox + boilerplate signatures),
+    # persisted across runs
+    layout_cache_json = load_layout_cache_json()
+
+    section_pages: dict[tuple, list[int]] = {}
+    for chunk in chunks:
+        section = chunk["section"]
+        if section not in VISUAL_SECTIONS:
+            continue
+        key = (chunk["file_name"], section)
+        all_pages = chunk.get("all_pages") or [chunk["page"]]
+        existing  = section_pages.get(key, [])
+        merged    = sorted(set(existing + all_pages))
+        section_pages[key] = merged
+
+    for (file_name, section), all_pages in section_pages.items():
+        map_key = f"{file_name}|{section}|pages{all_pages[0]}-{all_pages[-1]}"
+
+        pdf_path = os.path.join(PDF_FOLDER, file_name)
+        if not os.path.exists(pdf_path):
+            print(f"  [WARN] PDF not found: {pdf_path}")
+            continue
+
+        print(f"  [DEBUG] Extracting '{section}' from {file_name}, pages={all_pages}")
+
+        stitched = None
+        try:
+            pdf = fitz.open(pdf_path)
+
+            # get (and cache) this PDF's real content-area + boilerplate analysis
+            cleaner = get_layout_cleaner(pdf, file_name, layout_cache_json)
+            print(f"    [DEBUG] layout cleaner ready for {file_name}: "
+                  f"{len(cleaner._boilerplate_signatures)} boilerplate signature(s) detected")
+
+            if section in TABLE_SECTIONS:
+                stitched = _rasterise_table_crops(
+                    pdf, all_pages, section, cleaner,
+                )
+            else:
+                strips = []
+                for i, pg in enumerate(all_pages):
+                    pi = pg - 1
+                    if pi < len(pdf):
+                        strip = _rasterise_flowchart(
+                            pdf[pi],
+                            section,
+                            cleaner,
+                            dpi=IMAGE_DPI,
+                            is_first_page=(i == 0),
+                            is_last_page=(i == len(all_pages) - 1),
+                        )
+                        if strip is not None:   # skip pages that turned out to belong to the next section
+                            strips.append(strip)
+                stitched = _stitch_vertical(strips) if strips else None
+
+            pdf.close()
+        except Exception as e:
+            print(f"  [ERROR] Crop failed for '{section}' in {file_name}: {e}")
+            traceback.print_exc()
+            print(f"  [SKIP] Moving to next section/file...\n")
+            continue
+
+        if stitched is None:
+            print(f"  [WARN] No image produced for '{section}' in {file_name}")
+            continue
+
+        safe_name = re.sub(r"[^\w\-.]", "_", map_key) + ".jpg"
+        out_path  = os.path.join(IMAGES_FOLDER, safe_name)
+        stitched.save(out_path, "JPEG", quality=90)
+        image_map[map_key] = out_path
+        print(f"  Saved image for '{section}' ({len(all_pages)} page(s)): {out_path}")
+
+    # persist the layout analysis cache so future runs skip re-detection
+    save_layout_cache_json(layout_cache_json)
+
+    return image_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAGE MAP I/O
+# ─────────────────────────────────────────────────────────────────────────────
+def save_image_map(image_map):
+    with open(IMAGE_MAP_FILE, "w", encoding="utf-8") as f:
+        json.dump(image_map, f, indent=2)
+
+def load_image_map():
+    if os.path.exists(IMAGE_MAP_FILE):
+        with open(IMAGE_MAP_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAGE LOOKUP
+# ─────────────────────────────────────────────────────────────────────────────
+def get_chunk_images(
+    retrieved_chunks: list[dict],
+    image_map:        dict[str, str],
+    query:            str = "",
+    file_filter:      str | None = None,
+    chunks:           list[dict] | None = None,
+) -> list[dict]:
+    images = []
+    seen   = set()
+
+    def _file_matches(map_file: str, filter_file: str) -> bool:
+        return map_file.lower() == filter_file.lower()
+
+    allowed_files = None
+    if not file_filter:
+        allowed_files = {c["file_name"] for c in retrieved_chunks}
+
+    target_section = _detect_visual_section(query) if query else None
+
+    # When there's no explicit file_filter and the query targets a
+    # specific visual section (RACI / SIPOC / flowchart), don't leave
+    # `allowed_files` as the union of every file that happened to appear in
+    # `retrieved_chunks` — that union is exactly how images from an
+    # unrelated document were slipping into the answer (retrieve() can
+    # legitimately pull the same-named section from multiple files into its
+    # top-K, since it gets a +3.0 score bonus in EVERY file it appears in).
+    # Instead, collapse to just the single best-scoring file for this
+    # section. `retrieved_chunks` is already sorted by score, so the first
+    # chunk matching target_section is our best guess.
+    if target_section and not file_filter and allowed_files:
+        section_files_in_order = [
+            c["file_name"] for c in retrieved_chunks
+            if c["section"] == target_section
+        ]
+        if section_files_in_order:
+            allowed_files = {section_files_in_order[0]}
+            print(f"  [DEBUG] No file_filter, narrowing '{target_section}' "
+                  f"images to top-scoring file → {section_files_in_order[0]}")
+
+    if target_section:
+        for key, path in image_map.items():
+            parts = key.split("|")
+            if len(parts) < 2:
+                continue
+            if parts[1] != target_section:
+                continue
+            if file_filter and not _file_matches(parts[0], file_filter):
+                continue
+            if allowed_files is not None and parts[0] not in allowed_files:
+                continue
+            if not os.path.exists(path):
+                print(f"  [WARN] Image file missing: {path}, skipping")
+                continue
+            if key not in seen:
+                page_part = parts[2] if len(parts) > 2 else "pages1-1"
+                page_nums = re.findall(r"\d+", page_part)
+                pages = (
+                    list(range(int(page_nums[0]), int(page_nums[-1]) + 1))
+                    if page_nums else [1]
+                )
+                images.append({
+                    "file_name":  parts[0],
+                    "section":    parts[1],
+                    "pages":      pages,
+                    "image_path": path,
+                })
+                seen.add(key)
+
+        if not images and chunks is not None:
+            print(f"  [INFO] No image found for '{target_section}' — re-extracting …")
+            scope = [
+                c for c in chunks
+                if c["section"] == target_section
+                and (file_filter is None or _file_matches(c["file_name"], file_filter))
+                and (allowed_files is None or c["file_name"] in allowed_files)
+            ]
+            if scope:
+                new_map = extract_section_images(scope)
+                image_map.update(new_map)
+                save_image_map(image_map)
+                return get_chunk_images(
+                    retrieved_chunks, image_map,
+                    query=query, file_filter=file_filter, chunks=None
+                )
+
+        return images
+
+    for c in retrieved_chunks:
+        if c["section"] not in VISUAL_SECTIONS:
+            continue
+        all_pages = c.get("all_pages") or [c["page"]]
+        key = (
+            f"{c['file_name']}|{c['section']}|"
+            f"pages{all_pages[0]}-{all_pages[-1]}"
+        )
+        if key in image_map and key not in seen:
+            path = image_map[key]
+            if os.path.exists(path):
+                images.append({
+                    "file_name":  c["file_name"],
+                    "section":    c["section"],
+                    "pages":      all_pages,
+                    "image_path": path,
+                })
+                seen.add(key)
+
+    return images
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RETRIEVAL
+# ─────────────────────────────────────────────────────────────────────────────
+def retrieve(query, model, index, chunks, bm25=None, file_filter=None):
+    query_lower = query.lower()
+
+    search_chunks = chunks
+    search_index  = index
+
+    if file_filter:
+        search_chunks = [
+            c for c in chunks
+            if c["file_name"].lower() == file_filter.lower()
+        ]
+        if search_chunks:
+            search_index = build_sub_index(model, search_chunks)
+        else:
+            print(f"[WARN] file_filter '{file_filter}' matched no chunks")
+            search_chunks = chunks
+            search_index  = index
+
+    visual_section = _detect_visual_section(query)
+    if visual_section and file_filter:
+        exact = [
+            {**c, "score": 999.0}
+            for c in search_chunks
+            if c["section"] == visual_section
+        ]
+        if exact:
+            return exact[:FINAL_K]
+
+    if file_filter:
+        for sec in SECTION_NAMES_LOWER:
+            if sec in query_lower:
+                exact = [
+                    {**c, "score": 999.0}
+                    for c in search_chunks
+                    if c["section"].lower() == sec
+                ]
+                if exact:
+                    return exact[:FINAL_K]
+
+    is_summary = _is_summary_query(query)
+    if is_summary and file_filter:
+        summary_chunks = sorted(
+            [{**c, "score": 999.0} for c in search_chunks],
+            key=lambda x: (x["page"], x["chunk_id"])
+        )
+        if summary_chunks:
+            return summary_chunks[:FINAL_K]
+
+    # Only treat a capitalized token as "the user wants a definition" when
+    # the query actually reads like a definition request. Previously ANY
+    # capitalized 2-10 letter word (SOP, RACI, OK, a random acronym typed
+    # in caps, etc.) triggered this branch and force-scored matching
+    # chunks at 1000 -- completely bypassing normal relevance ranking and
+    # injecting a possibly-unrelated chunk as if it were certain to be
+    # correct. That's a direct hallucination vector: a high forced score
+    # tells the LLM "trust this completely" even when it doesn't answer
+    # the actual question.
+    DEFINE_INTENT_PATTERN = re.compile(
+        r"\b(what\s+is|what\s+does|define|definition\s+of|"
+        r"full\s+form\s+of|stands?\s+for|meaning\s+of|expand)\b",
+        re.IGNORECASE,
+    )
+
+    m = re.search(r"\b([A-Z]{2,10})\b", query) if DEFINE_INTENT_PATTERN.search(query) else None
+
+    if m:
+        abbr = m.group(1)
+        definition_patterns = [
+            rf"\b[A-Za-z][A-Za-z0-9\s,&/-]{{3,80}}\(\s*{abbr}\s*\)",
+            rf"{abbr}\s*stands\s*for",
+            rf"{abbr}\s*:",
+            rf"{abbr}\s*-"
+        ]
+        definition_chunks = []
+        for c in search_chunks:
+            for p in definition_patterns:
+                if re.search(p, c["text"], re.IGNORECASE):
+                    cc = c.copy()
+                    cc["score"] = 1000.0
+                    definition_chunks.append(cc)
+                    break
+        if definition_chunks:
+            definition_chunks.sort(key=lambda x: x["score"], reverse=True)
+            return definition_chunks[:1]
+
+    q_emb       = model.encode([query], normalize_embeddings=True)
+    scores, ids = search_index.search(np.array(q_emb, dtype="float32"), TOP_K)
+
+    results = []
+    for idx, score in zip(ids[0], scores[0]):
+        if idx == -1:
+            continue
+        c          = search_chunks[idx].copy()
+        c["score"] = float(score)
+        if c["section"].lower() in query_lower:
+            c["score"] += 3.0
+
+        if m:
+            abbr = m.group(1)
+            for p in definition_patterns:
+                if re.search(p, c["text"], re.IGNORECASE):
+                    c["score"] += 8
+                    break
+
+        results.append(c)
+
+    if bm25 and not file_filter:
+        bm25_scores = bm25.get_scores(query_lower.split())
+        top_bm25    = np.argsort(bm25_scores)[-TOP_K:]
+        for i in top_bm25:
+            if i >= len(chunks):
+                continue
+            c          = chunks[i].copy()
+            c["score"] = float(bm25_scores[i]) * 0.2
+            if m:
+                abbr = m.group(1)
+                if re.search(rf"\(\s*{abbr}\s*\)", c["text"], re.IGNORECASE):
+                    c["score"] += 8
+            results.append(c)
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    final    = []
+    seen_ids = set()
+    for c in results:
+        cid = c["chunk_id"]
+        if cid not in seen_ids:
+            final.append(c)
+            seen_ids.add(cid)
+        if len(final) >= FINAL_K:
+            break
+
+    SCORE_THRESHOLD = 0.25
+    filtered = [c for c in final if c["score"] >= SCORE_THRESHOLD]
+    if filtered:
+        return filtered[:FINAL_K]
+
+    # Previously: return final[:min(FINAL_K, 3)] -- forced through the top 3
+    # chunks no matter how irrelevant, and build_prompt() told the LLM it
+    # was NEVER allowed to say "not found". That combination guaranteed a
+    # confident, fabricated answer any time the real answer wasn't in the
+    # corpus. Returning nothing here lets ask() short-circuit to an honest
+    # "I couldn't find this" instead of forcing the LLM to invent one.
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERAL RETRIEVAL CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+GENERAL_TOP_K = 200
+
+GENERAL_FINAL_K = 100
+
+GENERAL_SCORE_THRESHOLD = 0.35
+
+GENERAL_BM25_WEIGHT = 0.60
+
+
+def retrieve_general(
+    query,
+    model,
+    index,
+    chunks,
+    bm25=None,
+):
+    """
+    Retrieval pipeline for generalized questions.
+
+    Unlike retrieve(), this function searches ALL SOPs and
+    gathers evidence from multiple documents.
+
+    Returns
+    -------
+    ranked_documents
+    """
+
+    print("\n[GENERAL RETRIEVAL MODE]\n")
+
+    # ----------------------------------------------------------
+    # FAISS SEARCH
+    # ----------------------------------------------------------
+
+    q_emb = model.encode(
+        [query],
+        normalize_embeddings=True
+    )
+
+    scores, ids = index.search(
+        np.array(q_emb, dtype="float32"),
+        GENERAL_TOP_K,
+    )
+
+    faiss_hits = [
+        (int(idx), float(score))
+        for idx, score in zip(ids[0], scores[0])
+        if idx != -1
+    ]
+
+    # ----------------------------------------------------------
+    # BM25 SEARCH
+    # ----------------------------------------------------------
+
+    bm25_hits = []
+
+    if bm25 is not None:
+
+        bm25_scores = bm25.get_scores(
+            query.lower().split()
+        )
+
+        top = np.argsort(
+            bm25_scores
+        )[-GENERAL_TOP_K:]
+
+        bm25_hits = [
+            (int(i), float(bm25_scores[i]))
+            for i in top
+        ]
+
+    # ----------------------------------------------------------
+    # NORMALIZE EACH SCORE SET TO [0, 1] BEFORE MERGING
+    # ----------------------------------------------------------
+    # FAISS cosine scores (~-1..1) and raw BM25 scores (often 0..20+)
+    # live on completely different scales. Merging them directly with
+    # only a flat weight — as before — let BM25 silently dominate the
+    # combined ranking, and made GENERAL_SCORE_THRESHOLD meaningless
+    # (a strong 0.6 cosine match could never outrank a mediocre BM25
+    # hit). Min-max normalising each set independently first puts both
+    # signals on the same footing before combining, so the relevance
+    # threshold below actually filters on comparable numbers.
+
+    def _minmax_normalise(pairs):
+        if not pairs:
+            return {}
+        vals = [v for _, v in pairs]
+        lo, hi = min(vals), max(vals)
+        span = hi - lo
+        if span < 1e-9:
+            return {idx: 1.0 for idx, _ in pairs}
+        return {idx: (v - lo) / span for idx, v in pairs}
+
+    faiss_norm = _minmax_normalise(faiss_hits)
+    bm25_norm  = _minmax_normalise(bm25_hits)
+
+    results = []
+
+    for idx in set(faiss_norm) | set(bm25_norm):
+
+        chunk = chunks[idx].copy()
+
+        chunk["score"] = (
+            faiss_norm.get(idx, 0.0) * (1 - GENERAL_BM25_WEIGHT)
+            + bm25_norm.get(idx, 0.0) * GENERAL_BM25_WEIGHT
+        )
+
+        results.append(chunk)
+
+    # ----------------------------------------------------------
+    # SORT
+    # ----------------------------------------------------------
+
+    results.sort(
+
+        key=lambda x: x["score"],
+
+        reverse=True,
+
+    )
+
+    # ----------------------------------------------------------
+    # KEEP ONLY RELEVANT CHUNKS
+    # ----------------------------------------------------------
+    # NOTE: this block used to be commented out while the code below it
+    # still referenced `relevant_chunks` — a guaranteed NameError on
+    # every single general-question query (is_general_question() routes
+    # here for anything like "what is X" / "responsibilities of Y").
+    # Restored, and now operating on properly normalised scores.
+
+    relevant_chunks = [
+        c
+        for c in results
+        if c["score"] >= GENERAL_SCORE_THRESHOLD
+    ]
+
+    # ----------------------------------------------------------
+    # If nothing survives,
+    # return best few anyway.
+    # ----------------------------------------------------------
+
+    if not relevant_chunks:
+
+        relevant_chunks = results[:15]
+
+    # ----------------------------------------------------------
+    # GROUP BY DOCUMENT
+    # ----------------------------------------------------------
+
+    grouped = group_chunks_by_document(
+        relevant_chunks
+    )
+
+    ranked_documents = rank_documents(
+        grouped
+    )
+
+    print_matching_documents(
+        ranked_documents
+    )
+
+    return ranked_documents
+
+
+def flatten_ranked_documents(
+    ranked_documents,
+    max_chunks_per_document=8,
+):
+    """
+    Convert ranked documents back into a list
+    of chunks for the LLM.
+
+    Keeps only the best chunks from each PDF.
+    """
+
+    final_chunks = []
+
+    for doc in ranked_documents:
+
+        chunks = sorted(
+
+            doc["chunks"],
+
+            key=lambda x: x["score"],
+
+            reverse=True,
+
+        )
+
+        final_chunks.extend(
+
+            chunks[:max_chunks_per_document]
+
+        )
+
+    return final_chunks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERAL CONTEXT BUILDING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_general_context(
+    ranked_documents,
+    max_chunks_per_document=6,
+):
+    """
+    Builds a structured context for the LLM.
+
+    Instead of mixing chunks from different PDFs together,
+    chunks are grouped by their source document.
+
+    Returns one large string.
+    """
+
+    context_parts = []
+
+    for doc in ranked_documents:
+
+        context_parts.append("\n" + "=" * 70)
+        context_parts.append(f"DOCUMENT : {doc['file_name']}")
+        context_parts.append(
+            f"Matching Sections : {doc['matches']}"
+        )
+        context_parts.append("=" * 70)
+
+        chunks = sorted(
+            doc["chunks"],
+            key=lambda x: x["score"],
+            reverse=True,
+        )
+
+        for chunk in chunks[:max_chunks_per_document]:
+
+            context_parts.append(
+
+                f"""
+Section : {chunk['section']}
+Page    : {chunk['page']}
+Score   : {chunk['score']:.3f}
+
+{chunk['text']}
+"""
+            )
+
+    return "\n".join(context_parts)
+
+
+def build_general_prompt(
+    query,
+    ranked_documents,
+):
+    """
+    Prompt used ONLY for generalized questions.
+    """
+
+    context = build_general_context(
+        ranked_documents
+    )
+
+    return f"""
+You are an enterprise SOP assistant.
+
+The retrieved context comes from MULTIPLE SOP documents.
+
+Your task is to answer the user's question by comparing all relevant SOPs.
+
+Rules
+
+1. Use ONLY the supplied context.
+
+2. Never use outside knowledge.
+
+3. If multiple SOPs define the same concept,
+   merge them into one coherent answer.
+
+4. If different SOPs describe different responsibilities,
+   include all of them.
+
+5. If documents disagree,
+   explicitly mention the difference.
+
+6. If only one SOP mentions something,
+   clearly say that.
+
+7. At the end include a section called
+
+Supporting SOPs
+
+listing every SOP that contributed.
+
+8. Never invent information.
+
+9. If the answer cannot be found,
+   say so.
+
+------------------------------------------------------------
+
+CONTEXT
+
+{context}
+
+------------------------------------------------------------
+
+QUESTION
+
+{query}
+
+------------------------------------------------------------
+
+ANSWER
+"""
+
+
+def build_source_summary(
+    ranked_documents,
+):
+    """
+    Returns a clean summary of which SOPs
+    contributed to the answer.
+    """
+
+    summary = []
+
+    for doc in ranked_documents:
+
+        summary.append(
+
+            {
+
+                "file_name": doc["file_name"],
+
+                "matches": doc["matches"],
+
+                "avg_score": round(
+                    doc["avg_score"],
+                    3,
+                ),
+
+            }
+
+        )
+
+    return summary
+
+
+def balance_documents(
+    ranked_documents,
+    max_chunks=6,
+):
+    """
+    Limits the number of chunks taken
+    from any one document.
+
+    Prevents a single large SOP
+    from overwhelming smaller ones.
+    """
+
+    balanced = []
+
+    for doc in ranked_documents:
+
+        chunks = sorted(
+
+            doc["chunks"],
+
+            key=lambda x: x["score"],
+
+            reverse=True,
+
+        )
+
+        new_doc = doc.copy()
+
+        new_doc["chunks"] = chunks[:max_chunks]
+
+        balanced.append(new_doc)
+
+    return balanced
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMPT BUILDING
+# ─────────────────────────────────────────────────────────────────────────────
+def build_prompt(query, chunks, file_filter=None):
+    context = "\n\n".join(
+        f"[{c['file_name']} | Page {c.get('page')} | Section: {c.get('section')}]\n{c['text']}"
+        for c in chunks
+    )
+    file_rule = f"\nONLY use information from '{file_filter}'." if file_filter else ""
+
+    is_summary = _is_summary_query(query)
+    summary_rule = (
+        "\n12. The user wants a SUMMARY. Synthesise ALL provided chunks into a "
+        "coherent overview — cover purpose, scope, key processes, responsibilities, "
+        "and any important references. Do NOT say information is missing; use what is given."
+    ) if is_summary else ""
+
+    return f"""You are a strict SOP assistant.
+
+Rules:
+1. Use ONLY the supplied context — never fabricate information, and never
+   fall back on outside/general knowledge to fill gaps.
+2. If the answer exists in the context, provide it in full, staying close
+   to the source's own wording for key facts (names, numbers, roles,
+   thresholds, steps).
+3. When multiple chunks are provided, prioritise exact section matches.
+4. Always cite the file name, page number, and section for every fact.
+5. Quote the relevant text where useful.{file_rule}
+6. Answer ONLY using the chunks that directly answer the user's question.
+   Ignore any chunk that is merely topically related but doesn't actually
+   address what was asked.
+7. If NONE of the supplied chunks actually answer the question, say so
+   plainly — e.g. "The provided SOP context does not cover this." Do not
+   guess, extrapolate, or answer from a chunk that doesn't really address
+   the question just to avoid saying it wasn't found.
+8. If exactly one chunk answers the question, answer only from that chunk.
+9. If multiple chunks cover the same topic, you may merge them into one
+   coherent answer, but do NOT combine facts from different chunks into a
+   new claim that neither chunk states on its own.
+10. Always cite only the chunk(s) actually used for the answer.{summary_rule}
+
+CONTEXT:
+{context}
+
+QUESTION:
+{query}
+
+ANSWER:"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM CALL
+# ─────────────────────────────────────────────────────────────────────────────
+def generate(prompt):
+    client = Groq(api_key=GROQ_API_KEY)
+    res = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a strict SOP assistant. Never hallucinate."},
+            {"role": "user",   "content": prompt},
+        ],
+        temperature=0.1,
+        max_tokens=1500,
+    )
+    return res.choices[0].message.content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADD NEW DOCUMENTS
+# ─────────────────────────────────────────────────────────────────────────────
+def add_new_documents(model, chunks, index):
+    global LAST_UPLOADED_FILE
+
+    processed = load_processed()
+    new_files = get_new_pdfs()
+
+    if not new_files:
+        print("No new PDFs found")
+        return chunks, index
+
+    print(f"Found {len(new_files)} new PDF(s)")
+
+    layout_cache_json = load_layout_cache_json()
+
+    docs = []
+    for pdf in new_files:
+        try:
+            pdf_doc = fitz.open(str(pdf))
+            cleaner = get_layout_cleaner(pdf_doc, pdf.name, layout_cache_json)
+            pages   = []
+            for i in range(len(pdf_doc)):
+                # same clean-text extraction as load_pdfs() — see that function
+                # for what get_clean_text() strips and why
+                text = cleaner.get_clean_text(pdf_doc[i]).strip()
+                pages.append({"page": i + 1, "text": text})   # same fix as load_pdfs()
+            pdf_doc.close()
+            docs.append({"file_name": pdf.name, "pages": pages})
+        except Exception as e:
+            print(f"\n  [ERROR] Failed to load/analyze new PDF '{pdf.name}': {e}")
+            traceback.print_exc()
+            print(f"  [SKIP] Continuing with remaining new PDFs...\n")
+            continue
+
+    save_layout_cache_json(layout_cache_json)
+
+    new_chunks = chunk_documents(docs)
+    if not new_chunks:
+        return chunks, index
+
+    next_id = max([c["chunk_id"] for c in chunks], default=-1) + 1
+    for i, c in enumerate(new_chunks):
+        c["chunk_id"] = next_id + i
+
+    texts      = [_chunk_to_text(c) for c in new_chunks]
+    embeddings = model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=True)
+    index.add(np.array(embeddings, dtype="float32"))
+
+    chunks.extend(new_chunks)
+
+    new_image_map = extract_section_images(new_chunks)
+    image_map     = load_image_map()
+    image_map.update(new_image_map)
+
+    save_image_map(image_map)
+    save_chunks(chunks)
+    faiss.write_index(index, INDEX_FILE)
+
+    for pdf in new_files:
+        processed[pdf.name] = file_hash(pdf)
+    save_processed(processed)
+
+    LAST_UPLOADED_FILE = new_files[-1].name
+    _save_last_uploaded(LAST_UPLOADED_FILE)   # persist across restarts
+
+    print(f"Added {len(new_chunks)} new chunks")
+    print(f"[LAST_UPLOADED_FILE] → {LAST_UPLOADED_FILE}")
+    return chunks, index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+def setup(force_reindex: bool = False):
+    """
+    Pass force_reindex=True the FIRST time you run this file after adding the
+    header/footer body-bbox fix, so the old image cache (cropped with the
+    header/footer-INCLUSIVE content bbox) gets rebuilt using get_body_bbox().
+    """
+    global LAST_UPLOADED_FILE
+
+    if force_reindex:
+        for f in (CHUNKS_FILE, INDEX_FILE, IMAGE_MAP_FILE, PROCESSED_FILES, HEADER_FOOTER_MAP_FILE):
+            if os.path.exists(f):
+                os.remove(f)
+        if os.path.isdir(IMAGES_FOLDER):
+            import shutil
+            shutil.rmtree(IMAGES_FOLDER)
+        print("  [force_reindex] Cleared old caches — rebuilding from scratch.")
+
+    # restore LAST_UPLOADED_FILE from disk so file disambiguation
+    # (visual-section fallback in detect_file_filter) still works correctly
+    # after a process restart, instead of resetting to None every time.
+    LAST_UPLOADED_FILE = _load_last_uploaded()
+    if LAST_UPLOADED_FILE:
+        print(f"  [LAST_UPLOADED_FILE] Restored from disk → {LAST_UPLOADED_FILE}")
+
+    print("\n── Loading chunks ──")
+    if os.path.exists(CHUNKS_FILE):
+        chunks = load_chunks()
+        print(f"  Loaded {len(chunks)} chunks from cache")
+    else:
+        docs   = load_pdfs(PDF_FOLDER)
+        chunks = chunk_documents(docs)
+        save_chunks(chunks)
+
+        processed = {}
+        for pdf in Path(PDF_FOLDER).glob("*.pdf"):
+            processed[pdf.name] = file_hash(pdf)
+        save_processed(processed)
+
+    print("\n── Loading embedding model ──")
+    model = SentenceTransformer(EMBED_MODEL)
+
+    print("\n── Loading FAISS index ──")
+    if os.path.exists(INDEX_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        print("  Loaded index from cache")
+    else:
+        print("  Building index …")
+        index = build_index(chunks, model)
+
+    print("\n── Building BM25 ──")
+    bm25 = build_bm25(chunks)
+
+    print("\n── Loading image map ──")
+    image_map = load_image_map()
+
+    expected_keys = {
+        (c["file_name"], c["section"])
+        for c in chunks
+        if c["section"] in VISUAL_SECTIONS
+    }
+    valid_map_entries = {
+        k: v for k, v in image_map.items()
+        if os.path.exists(v)
+    }
+    covered_keys = {
+        (k.split("|")[0], k.split("|")[1])
+        for k in valid_map_entries
+        if "|" in k
+    }
+    missing_keys = expected_keys - covered_keys
+
+    if missing_keys:
+        print(f"  [INFO] {len(missing_keys)} visual section(s) not in image map — extracting …")
+        print(f"  Missing: {missing_keys}")
+        new_images = extract_section_images(chunks)
+        image_map.update(new_images)
+        save_image_map(image_map)
+        print(f"  Total images in map: {len(image_map)}")
+    else:
+        print(f"  Loaded {len(valid_map_entries)} valid image(s) from cache")
+
+    return model, index, chunks, bm25, image_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASK — split into a resolve step + an answer step
+#
+# Previously ask() called Python's input() directly to disambiguate between
+# similarly-named SOPs. That works fine in a terminal, but breaks completely
+# in Streamlit: there is no stdin to read from during a script rerun, so
+# input() would either hang the app or raise immediately. The fix is to
+# separate "figure out which file this query targets" (pure, no I/O) from
+# "actually answer" (needs a resolved file_filter). Callers — CLI or
+# Streamlit — each handle the disambiguation UI in whatever way fits their
+# environment, then call ask() with a concrete file_filter.
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_file_filter(
+    query: str,
+    chunks: list[dict],
+    default_file: str | None = None,
+) -> dict:
+    """
+    Step 1 — figure out which file (if any) this query targets, without
+    doing any I/O or prompting.
+
+    Returns one of:
+      {"ambiguous": True,  "candidates": [file1, file2, ...]}
+      {"ambiguous": False, "file_filter": file_or_None}
+    """
+    # ambiguous = detect_ambiguous_documents(query, chunks)
+    # if ambiguous:
+    #     return {"ambiguous": True, "candidates": ambiguous}
+
+    matched_docs = detect_ambiguous_documents(query, chunks)
+
+    if matched_docs:
+        # Search only these PDFs
+        filtered_chunks = [
+            c for c in chunks
+            if c["file_name"] in matched_docs
+        ]
+    else:
+        # Search every PDF
+        filtered_chunks = chunks
+
+    file_filter = detect_file_filter(query, chunks, default_file=default_file)
+    return {"ambiguous": False, "file_filter": file_filter}
+
+
+def ask(query, model, index, chunks, bm25, image_map, file_filter):
+    """
+    Step 2 — actually answer, given an already-resolved file_filter (may be
+    None, meaning "search everything"). Callers must call
+    resolve_file_filter() first and handle the ambiguous case (asking the
+    user to pick) before calling this.
+    """
+    print(f"[DEBUG] file_filter = {file_filter}")
+
+    # ------------------------------------------------------------
+    # Decide which retrieval pipeline to use
+    # ------------------------------------------------------------
+
+    if is_general_question(query, chunks):
+
+        ranked_documents = retrieve_general(
+            query=query,
+            model=model,
+            index=index,
+            chunks=chunks,
+            bm25=bm25,
+        )
+
+        ranked_documents = balance_documents(
+            ranked_documents
+        )
+
+        retrieved = flatten_ranked_documents(
+            ranked_documents
+        )
+
+        prompt = build_general_prompt(
+            query,
+            ranked_documents,
+        )
+
+    else:
+
+        retrieved = retrieve(
+            query=query,
+            model=model,
+            index=index,
+            chunks=chunks,
+            bm25=bm25,
+            file_filter=file_filter,
+        )
+
+        prompt = build_prompt(
+            query,
+            retrieved,
+        )
+
+    if not retrieved:
+        # Nothing cleared the relevance bar. Previously retrieve() would
+        # still force through its top 3 (irrelevant) chunks here, and the
+        # LLM would be asked to answer from them anyway -- the single
+        # biggest source of confident-sounding fabrication. Skipping the
+        # LLM call entirely when there's genuinely nothing relevant is far
+        # safer than handing it thin context and hoping the prompt rules
+        # stop it from filling the gap with general knowledge.
+        scope = f" in '{file_filter}'" if file_filter else ""
+        answer = (
+            f"I couldn't find anything in the SOP documents{scope} "
+            f"that answers this question."
+        )
+        return answer, [], file_filter, []
+
+    answer = generate(prompt)
+
+    images = get_chunk_images(
+        retrieved,
+        image_map,
+        query=query,
+        file_filter=file_filter,
+        chunks=chunks,
+    )
+
+    return answer, retrieved, file_filter, images
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # NOTE: set force_reindex=True for the first run after adding the
+    # get_body_bbox() header/footer fix, so old (still-cropped-with-header/
+    # footer) images get rebuilt. Switch back to False afterwards for
+    # normal incremental runs.
+    model, index, chunks, bm25, image_map = setup(force_reindex=True)
+
+    print("\n" + "═" * 60)
+    print("  RAG SYSTEM READY — type 'exit' to quit")
+    print("═" * 60 + "\n")
+
+    while True:
+        q = input("Question: ").strip()
+        if not q:
+            continue
+        if q.lower() in {"exit", "quit"}:
+            break
+
+        resolution = resolve_file_filter(q, chunks, default_file=LAST_UPLOADED_FILE)
+
+        if resolution["ambiguous"]:
+            candidates = resolution["candidates"]
+
+            print("\nI found multiple SOPs matching your query:\n")
+            for i, f in enumerate(candidates, 1):
+                print(f"{i}. {Path(f).stem}")
+
+            file_filter = None
+            while file_filter is None:
+                choice = input(
+                    "\nSelect a document (number or part of the name): "
+                ).strip()
+
+                if choice.isdigit():
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(candidates):
+                        file_filter = candidates[idx]
+                        break
+
+                found = next(
+                    (f for f in candidates if choice.lower() in f.lower()),
+                    None,
+                )
+                if found:
+                    file_filter = found
+                    break
+
+                print("Invalid selection. Please try again.")
+        else:
+            file_filter = resolution["file_filter"]
+
+        answer, sources, file_filter, images = ask(
+            q, model, index, chunks, bm25, image_map, file_filter
+        )
+
+        print("\n" + "─" * 60)
+        if file_filter:
+            print(f"  [File filter applied: {file_filter}]")
+        print(f"\nANSWER:\n{answer}\n")
+
+        if images:
+            print("VISUAL REFERENCES:")
+            for img in images:
+                pages_str = (
+                    f"Pages {img['pages'][0]}–{img['pages'][-1]}"
+                    if len(img["pages"]) > 1
+                    else f"Page {img['pages'][0]}"
+                )
+                print(f"  [{img['file_name']} | {img['section']} | {pages_str}]")
+                print(f"  → {img['image_path']}")
+        else:
+            print("VISUAL REFERENCES: (none)")
+
+        print("\nSOURCES:")
+        for i, s in enumerate(sources[:5], 1):
+            print(f"  {i}. {s['file_name']} | {s['section']} | Page {s['page']} "
+                  f"(score={s['score']:.3f})")
+        print("─" * 60 + "\n")
