@@ -1,0 +1,439 @@
+import time
+import streamlit as st
+from pathlib import Path
+from test12 import (
+    setup,
+    ask,
+    resolve_file_filter,
+    add_new_documents,
+    build_bm25,
+    load_image_map,
+    PDF_FOLDER,
+    VISUAL_SECTIONS,
+    TABLE_SECTIONS,
+    FLOWCHART_SECTIONS,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="SOP Assistant",
+    page_icon="📋",
+    layout="wide",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE
+# ─────────────────────────────────────────────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Holds {"query": ..., "candidates": [...]} whenever a question matches
+# multiple similarly-named SOPs and we're waiting on the user to pick one
+# via the button prompt below. None means there's nothing pending.
+if "pending_disambiguation" not in st.session_state:
+    st.session_state.pending_disambiguation = None
+
+# Mirrors the CLI's LAST_UPLOADED_FILE global, but scoped to this browser
+# session instead of the whole process — so the "last uploaded file" default
+# used by detect_file_filter()'s visual-section fallback still works after
+# an upload, without one user's upload silently becoming another user's
+# default in a multi-user deployment.
+if "last_uploaded_file" not in st.session_state:
+    st.session_state.last_uploaded_file = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD PIPELINE
+# cached_resource caches the heavy objects (model, index) across reruns.
+# We store mutable state (chunks, bm25, image_map) in session_state so that
+# add_new_documents() updates are visible after rerun without clearing the cache.
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="⏳ Loading SOP knowledge base…")
+def load_static_pipeline():
+    """
+    Returns only the objects that are expensive to build and never mutated:
+    embed_model and faiss_index.
+    chunks, bm25, image_map are mutable and live in session_state instead.
+    """
+    model, index, chunks, bm25, image_map = setup()
+    return model, index, chunks, bm25, image_map
+
+
+embed_model, faiss_index, _init_chunks, _init_bm25, _init_image_map = load_static_pipeline()
+
+# Seed session state on first load only
+if "chunks" not in st.session_state:
+    st.session_state.chunks    = _init_chunks
+if "bm25" not in st.session_state:
+    st.session_state.bm25      = _init_bm25
+if "image_map" not in st.session_state:
+    st.session_state.image_map = _init_image_map
+
+# Convenient local aliases (read from session_state every rerun)
+all_chunks = st.session_state.chunks
+bm25       = st.session_state.bm25
+image_map  = st.session_state.image_map
+
+if not Path(PDF_FOLDER).exists():
+    Path(PDF_FOLDER).mkdir(parents=True, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DERIVED METADATA
+# ─────────────────────────────────────────────────────────────────────────────
+unique_files = sorted({c["file_name"] for c in all_chunks})
+
+unique_sections = sorted({
+    c.get("section", "")
+    for c in all_chunks
+    if c.get("section", "") not in ("", "Cover Page")
+})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+
+    st.markdown("---")
+    st.subheader("📤 Upload SOP")
+
+    uploaded_pdf = st.file_uploader(
+        "Select SOP PDF",
+        type=["pdf"],
+        key="pdf_upload",
+    )
+
+    if uploaded_pdf:
+
+        st.write(f"Selected: **{uploaded_pdf.name}**")
+
+        if st.button("➕ Add Document", use_container_width=True):
+
+            try:
+                save_path = Path(PDF_FOLDER) / uploaded_pdf.name
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_pdf.getbuffer())
+
+                with st.spinner("Processing document and updating knowledge base..."):
+
+                    # add_new_documents mutates faiss_index in-place and
+                    # returns the extended chunks list
+                    updated_chunks, updated_index = add_new_documents(
+                        embed_model,
+                        st.session_state.chunks,
+                        faiss_index,
+                    )
+
+                    # Persist mutable state back into session_state
+                    st.session_state.chunks    = updated_chunks
+                    st.session_state.bm25      = build_bm25(updated_chunks)
+                    st.session_state.image_map = load_image_map()
+
+                    # Track this as the "last uploaded" file for this
+                    # session, mirroring the CLI's LAST_UPLOADED_FILE so
+                    # unqualified follow-up questions (e.g. "show me the
+                    # RACI matrix") default to the file just uploaded.
+                    st.session_state.last_uploaded_file = uploaded_pdf.name
+
+                st.success(f"✅ {uploaded_pdf.name} uploaded and indexed successfully")
+                time.sleep(1)
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Upload failed:\n\n{e}")
+
+    st.header("ℹ️ Pipeline Info")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("📄 Documents",  len(unique_files))
+        st.metric("📑 Sections",   len(unique_sections))
+    with col2:
+        st.metric("🧩 Chunks",     len(all_chunks))
+        st.metric("💬 Messages",   len(st.session_state.messages))
+
+    st.markdown("---")
+
+    debug_mode = st.checkbox("🐞 Debug Retrieval", value=False)
+
+    st.markdown("---")
+
+    st.subheader("📄 Documents")
+    for fname in unique_files:
+        count = sum(1 for c in all_chunks if c["file_name"] == fname)
+        st.markdown(f"- **{fname}** ({count} chunks)")
+
+    st.markdown("---")
+
+    st.subheader("📑 Sections")
+    for sec in unique_sections:
+        tag = ""
+        if sec in TABLE_SECTIONS:
+            tag = " 🗂️"
+        elif sec in FLOWCHART_SECTIONS:
+            tag = " 🔀"
+        st.markdown(f"- {sec}{tag}")
+
+    st.markdown("---")
+
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state.messages = []
+        st.session_state.pending_disambiguation = None
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER — source card
+# ─────────────────────────────────────────────────────────────────────────────
+def render_source_card(chunk: dict):
+    with st.container(border=True):
+
+        c1, c2, c3, c4, c5 = st.columns([3, 1, 2, 1, 1])
+        c1.markdown(f"**📄 {chunk['file_name']}**")
+        c2.markdown(f"📖 Page **{chunk['page']}**")
+        c3.markdown(f"📑 **{chunk.get('section', 'Unknown')}**")
+        c4.markdown(f"🔢 \#{chunk.get('chunk_id', '?')}")
+
+        score = chunk.get("score", 0)
+        emoji = "🟢" if score > 5 else ("🟡" if score > 1 else "🔴")
+        c5.markdown(f"{emoji} **{score:.3f}**")
+
+        all_pages = chunk.get("all_pages") or [chunk["page"]]
+        pages_str = (
+            f"Pages {all_pages[0]}–{all_pages[-1]}"
+            if len(all_pages) > 1
+            else f"Page {all_pages[0]}"
+        )
+        st.caption(
+            f"Spans: {pages_str} | "
+            f"Words: {chunk.get('word_count', '?')}"
+        )
+
+        with st.expander("📝 Retrieved Text"):
+            st.text(chunk["text"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER — visual section images
+# ─────────────────────────────────────────────────────────────────────────────
+def render_images(images: list[dict]):
+    if not images:
+        return
+
+    for img in images:
+        pages     = img["pages"]
+        pages_str = (
+            f"Pages {pages[0]}–{pages[-1]}"
+            if len(pages) > 1
+            else f"Page {pages[0]}"
+        )
+
+        section = img["section"]
+        icon    = "🗂️" if section in TABLE_SECTIONS else "🔀"
+
+        st.caption(
+            f"{icon} **{img['file_name']}** — {section} ({pages_str})"
+        )
+
+        img_path = img["image_path"]
+        if Path(img_path).exists():
+            st.image(img_path, use_container_width=True)
+        else:
+            st.warning(f"Image file not found on disk: `{img_path}`")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER — run ask() for a resolved file_filter and append to chat history
+#
+# Factored out so both the normal chat-input path and the disambiguation
+# button path (below) can share the exact same "answer + render + store"
+# logic instead of duplicating it.
+# ─────────────────────────────────────────────────────────────────────────────
+def run_ask_and_store(question: str, file_filter: str | None):
+    with st.chat_message("assistant"):
+
+        start = time.time()
+
+        with st.spinner("Searching SOPs…"):
+            try:
+                answer, retrieved_chunks, resolved_filter, images = ask(
+                    question,
+                    embed_model,
+                    faiss_index,
+                    st.session_state.chunks,
+                    st.session_state.bm25,
+                    st.session_state.image_map,
+                    file_filter,
+                )
+            except Exception as e:
+                st.error(f"Something went wrong:\n\n{e}")
+                return
+
+        elapsed = time.time() - start
+
+        st.caption(f"⏱ Response in {elapsed:.2f} sec · {len(retrieved_chunks)} chunks retrieved")
+
+        if resolved_filter:
+            st.info(f"📄 File filter applied: **{resolved_filter}**")
+
+        tab1, tab2, tab3 = st.tabs(
+            ["💬 Answer", "📊 Visual References", "🔍 Retrieved Chunks"]
+        )
+
+        with tab1:
+            st.markdown(answer)
+
+        with tab2:
+            if images:
+                render_images(images)
+            else:
+                st.info(
+                    "No visual references (RACI / SIPOC / Flowchart) "
+                    "were retrieved for this query."
+                )
+
+        with tab3:
+            for i, chunk in enumerate(retrieved_chunks, start=1):
+                st.markdown(f"##### Source {i}")
+                render_source_card(chunk)
+
+        if debug_mode:
+            st.markdown("---")
+            st.subheader("🐞 Retrieval Debug")
+            for chunk in retrieved_chunks:
+                st.write({
+                    "chunk_id":  chunk.get("chunk_id"),
+                    "file":      chunk["file_name"],
+                    "page":      chunk["page"],
+                    "all_pages": chunk.get("all_pages"),
+                    "section":   chunk.get("section"),
+                    "score":     round(chunk.get("score", 0), 4),
+                    "words":     chunk.get("word_count"),
+                })
+
+        st.session_state.messages.append({
+            "role":    "assistant",
+            "content": answer,
+            "chunks":  retrieved_chunks,
+            "images":  images,
+            "meta": {
+                "file_filter": resolved_filter,
+                "elapsed":     elapsed,
+            },
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+st.title("📋 SOP Assistant")
+st.caption("Ask questions about SOP documents with full source traceability.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPLAY CHAT HISTORY
+# ─────────────────────────────────────────────────────────────────────────────
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+        if message["role"] == "assistant":
+
+            meta = message.get("meta", {})
+
+            if meta.get("file_filter"):
+                st.info(f"📄 File filter applied: **{meta['file_filter']}**")
+
+            if meta.get("elapsed"):
+                st.caption(f"⏱ {meta['elapsed']:.2f} sec")
+
+            if message.get("images"):
+                with st.expander("📊 Visual References", expanded=True):
+                    render_images(message["images"])
+
+            if message.get("chunks"):
+                with st.expander("🔍 Retrieved Sources", expanded=False):
+                    for chunk in message["chunks"]:
+                        render_source_card(chunk)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHAT INPUT
+#
+# Disabled while a disambiguation choice is pending, so the user resolves
+# that first via the buttons below rather than stacking up a second
+# in-flight question.
+# ─────────────────────────────────────────────────────────────────────────────
+question = st.chat_input(
+    "Ask about your SOP documents…",
+    disabled=st.session_state.pending_disambiguation is not None,
+)
+
+if question:
+
+    st.session_state.messages.append({"role": "user", "content": question})
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    resolution = resolve_file_filter(
+        question,
+        st.session_state.chunks,
+        default_file=st.session_state.last_uploaded_file,
+    )
+
+    if resolution["ambiguous"]:
+        # Don't answer yet — stash the query + candidates. The button
+        # prompt below (rendered on the rerun this triggers) is what
+        # replaces the CLI's input()-based prompt.
+        st.session_state.pending_disambiguation = {
+            "query": question,
+            "candidates": resolution["candidates"],
+        }
+        st.rerun()
+    else:
+        st.session_state.pending_disambiguation = None
+        run_ask_and_store(question, resolution["file_filter"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISAMBIGUATION PROMPT
+#
+# Renders as tappable buttons — one per candidate SOP — whenever a query
+# matched more than one similarly-named document. This is the Streamlit
+# equivalent of the CLI's "Select a document (number or part of the name)"
+# input() prompt, which has no meaning inside a Streamlit rerun.
+# ─────────────────────────────────────────────────────────────────────────────
+if st.session_state.pending_disambiguation:
+    pending    = st.session_state.pending_disambiguation
+    candidates = pending["candidates"]
+
+    with st.chat_message("assistant"):
+        st.markdown(
+            f"Your question — **\"{pending['query']}\"** — matches multiple SOPs. "
+            "Which one did you mean?"
+        )
+
+        # Cap columns per row instead of always splitting into
+        # len(candidates) equal columns. With many candidates, equal-width
+        # columns squeeze each button down to a sliver and wrap long
+        # filenames onto several lines; capping at 3-per-row keeps each
+        # button wide enough to read the name comfortably, and any extra
+        # candidates simply flow onto additional rows.
+        MAX_BUTTONS_PER_ROW = 3
+        chosen = None
+
+        for row_start in range(0, len(candidates), MAX_BUTTONS_PER_ROW):
+            row_candidates = candidates[row_start:row_start + MAX_BUTTONS_PER_ROW]
+            # Pad the column count out to MAX_BUTTONS_PER_ROW on a partial
+            # last row so its buttons stay the same width as full rows,
+            # rather than stretching to fill the leftover space.
+            cols = st.columns(MAX_BUTTONS_PER_ROW)
+            for col, f in zip(cols, row_candidates):
+                if col.button(Path(f).stem, key=f"disambig_{f}", use_container_width=True):
+                    chosen = f
+
+        if chosen:
+            st.session_state.pending_disambiguation = None
+            run_ask_and_store(pending["query"], chosen)
+            st.rerun()
